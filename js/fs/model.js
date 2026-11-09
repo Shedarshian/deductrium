@@ -568,7 +568,7 @@ export class ModelOperations {
     }
     /** Verify schematic branches with fresh rigid metavariables, not sampled formulas. */
     validateInduction(recipe, common) {
-        if (!recipe || !/^\$[a-zA-Z0-9_]+$/.test(recipe.targetName) || !Array.isArray(recipe.rules) || recipe.rules.length !== 5 || recipe.rules.some(r => typeof r !== "string" || !r))
+        if (!recipe || !/^\$[a-zA-Z0-9_]+$/.test(recipe.targetName) || !Array.isArray(recipe.rules) || ![5, 9].includes(recipe.rules.length) || recipe.rules.some(r => typeof r !== "string" || !r))
             this.fail("结构归纳规则的配方无效");
         if (!Array.isArray(common) || common.length > 1024)
             this.fail("归纳共同前提数量超限");
@@ -611,13 +611,14 @@ export class ModelOperations {
             name = "$mi_probe_" + serial++;
         } while (names.has(name)); names.add(name); return v(name); };
         const [a, b, x, y] = [fresh(), fresh(), fresh(), fresh()];
-        const cases = [sym("@", x, y), sym("=", x, y), sym("~", a), sym(">", a, b), sym("V", x, a)];
-        const children = [[], [], [a], [a, b], [a]];
+        const cases = [sym("@", x, y), sym("=", x, y), sym("~", a), sym(">", a, b), sym("V", x, a),
+            sym("&", a, b), sym("|", a, b), sym("<>", a, b), sym("E", x, a)];
+        const children = [[], [], [a], [a, b], [a], [a, b], [a, b], [a, b], [a]];
         const old = this.fs.propositions;
         const budget = { left: 16384 };
-        let quantified = false;
+        let quantified = false, existentialQuantified = false;
         try {
-            for (let i = 0; i < 5; i++) {
+            for (let i = 0; i < recipe.rules.length; i++) {
                 const run = (quantifiedIH) => {
                     this.fs.propositions = [];
                     const available = common.map(c => this.fs.addHypothese(c, true));
@@ -631,18 +632,21 @@ export class ModelOperations {
                     run(false);
                 }
                 catch (directError) {
-                    if (i !== 4 || budget.left < 0)
+                    if ((i !== 4 && i !== 8) || budget.left < 0)
                         throw new Error("第 " + (i + 1) + " 个通用分支未通过核验：" + directError);
                     try {
                         run(true);
-                        quantified = true;
+                        if (i === 4)
+                            quantified = true;
+                        else
+                            existentialQuantified = true;
                     }
                     catch (quantifiedError) {
-                        throw new Error("全称分支既不能由 T[A]，也不能由 Vx:T[A] 推出目标：" + quantifiedError);
+                        throw new Error((i === 4 ? "全称" : "存在") + "分支既不能由 T[A]，也不能由 Vx:T[A] 推出目标：" + quantifiedError);
                     }
                 }
             }
-            return { quantified };
+            return { quantified, existentialQuantified };
         }
         finally {
             this.fs.propositions = old;
@@ -669,9 +673,9 @@ export class ModelOperations {
         return result;
     }
     /** Elaborate each concrete instance into checked existing inference steps. */
-    induct(template, target, rules, common, quantified = false) {
-        if (rules.length !== 5)
-            this.fail("依次提供属于、相等、否定、蕴含、全称五个分支规则");
+    induct(template, target, rules, common, quantified, existentialQuantified) {
+        if (![5, 9].includes(rules.length))
+            this.fail("需要五个基础分支；扩展模式还须提供合取、析取、互推、存在四个分支");
         if (common.some(i => !Number.isInteger(i) || i < 0 || !this.fs.propositions[i]))
             this.fail("共同前提定理编号无效");
         this.checkProperty(template, false);
@@ -696,10 +700,40 @@ export class ModelOperations {
                 branch = 4;
                 children = [a.nodes[1]];
             }
+            else if (rules.length === 9 && a.type === "sym" && ["&", "|", "<>"].includes(a.name) && a.nodes?.length === 2) {
+                branch = { "&": 5, "|": 6, "<>": 7 }[a.name];
+                children = a.nodes;
+            }
+            else if (rules.length === 9 && a.type === "sym" && a.name === "E" && a.nodes?.length === 2 && this.plainVariable(a.nodes[0])) {
+                branch = 8;
+                children = [a.nodes[1]];
+            }
             else
-                return this.fail("归纳范围仅覆盖变量原子 x@y、x=y 及 ~、>、V；其余符号须先可靠消去");
-            const ih = children.map(construct).map(index => branch === 4 && quantified ? this.fs.generalizeModel(index, a.nodes[0]) : index);
-            return this.applyBranch(rules[branch], this.property(template, a), [...common, ...ih], budget);
+                return this.fail("目标超出所选归纳范围；扩展模式需要额外的 &、|、<>、E 分支，函数项和额外谓词仍须先可靠消去");
+            const results = children.map(construct);
+            const quantifier = branch === 4 || branch === 8;
+            const mode = branch === 4 ? quantified : branch === 8 ? existentialQuantified : false;
+            const attempt = (quantifiedIH) => {
+                const snapshot = this.fs.propositions.slice();
+                try {
+                    const ih = results.map(index => quantifiedIH ? this.fs.generalizeModel(index, a.nodes[0]) : index);
+                    return this.applyBranch(rules[branch], this.property(template, a), [...common, ...ih], budget);
+                }
+                catch (e) {
+                    this.fs.propositions = snapshot;
+                    throw e;
+                }
+            };
+            if (!quantifier || mode !== undefined)
+                return attempt(!!mode);
+            try {
+                return attempt(false);
+            }
+            catch (directError) {
+                if (budget.left < 0)
+                    throw directError;
+                return attempt(true);
+            }
         };
         try {
             return construct(target);

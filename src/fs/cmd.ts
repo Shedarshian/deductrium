@@ -234,7 +234,7 @@ export class FSCmd {
             switch (cmdBuffer[0]) {
                 case "unfold": case "sat-expand": case "abs-expand": return this.execModelExpand();
                 case "sat-def": return this.execSatDefinition();
-                case "mfinduct": return this.execModelInduction();
+                case "mfinduct": case "mfinduct-full": return this.execModelInduction();
                 case "copy": {
                     hintText.innerText = TR("可复制定理内容，按Esc取消");
                     if (cmdBuffer.length > 1) {
@@ -333,23 +333,26 @@ export class FSCmd {
     }
     private execModelInduction() {
         const b = this.cmdBuffer;
+        const commonAt = b[0] === "mfinduct-full" ? 12 : 8;
         const prompts = ["", "请输入性质公式模板，用 #slot 表示公式槽", "请输入具体目标公式；或输入 $A 形式的公式参数以创建可复用的结构归纳规则",
             "请选择属于原子分支的规则", "请选择相等原子分支的规则", "请选择否定构造分支的规则",
-            "请选择蕴含构造分支的规则", "请选择全称构造分支的规则", "请输入共同前提定理编号，以逗号分隔；无前提输入 -"];
-        if (b.length < 9) { this.gui.hintText.innerText = prompts[b.length]; return; }
-        if (b.length > 9 && !/^\$[a-zA-Z0-9_]+$/.test(b[2])) throw new Error("结构递归参数数量错误");
-        const common = b[8].trim() === "-" ? [] : b[8].split(",").map(x => this.modelProposition(x.trim()));
+            "请选择蕴含构造分支的规则", "请选择全称构造分支的规则",
+            ...(commonAt === 12 ? ["请选择合取构造分支的规则", "请选择析取构造分支的规则", "请选择互推构造分支的规则", "请选择存在构造分支的规则"] : []),
+            "请输入共同前提定理编号，以逗号分隔；无前提输入 -"];
+        if (b.length <= commonAt) { this.gui.hintText.innerText = prompts[b.length]; return; }
+        if (b.length > commonAt + 1 && !/^\$[a-zA-Z0-9_]+$/.test(b[2])) throw new Error("结构递归参数数量错误");
+        const common = b[commonAt].trim() === "-" ? [] : b[commonAt].split(",").map(x => this.modelProposition(x.trim()));
         const template = this.astparser.parse(b[1], true);
         const target = this.astparser.parse(b[2], true);
         if (target.type === "replvar" && /^\$[a-zA-Z0-9_]+$/.test(target.name)) {
-            if (!this.getInputNewDeductionPos(9)) return;
-            const rule = this.gui.formalSystem.model.createInduction(b[11], template, target.name, b.slice(3, 8), common.map(i => this.gui.formalSystem.propositions[i].value));
-            this.gui.addToDeductions(rule, b[9]);
+            if (!this.getInputNewDeductionPos(commonAt + 1)) return;
+            const rule = this.gui.formalSystem.model.createInduction(b[commonAt + 3], template, target.name, b.slice(3, commonAt), common.map(i => this.gui.formalSystem.propositions[i].value));
+            this.gui.addToDeductions(rule, b[commonAt + 1]);
             this.clearCmdBuffer(); this.gui.updateDeductionList();
             this.gui.hintText.innerText = "已生成结构归纳规则 " + rule + "；每次应用都会重新核验实际证明及量词侧条件";
             return;
         }
-        const result = this.gui.formalSystem.model.induct(template, target, b.slice(3, 8), common);
+        const result = this.gui.formalSystem.model.induct(template, target, b.slice(3, commonAt), common);
         this.clearCmdBuffer(); this.gui.updatePropositionList(true);
         this.gui.hintText.innerText = `已逐分支组合出 p${result}；这是具体公式的证明，不代表已证明任意公式模式`;
     }
@@ -1004,9 +1007,10 @@ export class FSCmd {
             else this.replaceActionInputFromClick(inserted);
             return;
         }
-        if (cmdBuffer[0] === "mfinduct") {
-            if (cmdBuffer.length === 9 && /^\$[a-zA-Z0-9_]+$/.test(cmdBuffer[2]) && this.gui.formalSystem.deductions[idx]) { cmdBuffer.push(idx); this.execCmdBuffer(); return; }
-            if (cmdBuffer.length >= 3 && cmdBuffer.length <= 7 && this.gui.formalSystem.deductions[idx]) { cmdBuffer.push(idx); this.execCmdBuffer(); }
+        if (cmdBuffer[0] === "mfinduct" || cmdBuffer[0] === "mfinduct-full") {
+            const commonAt = cmdBuffer[0] === "mfinduct-full" ? 12 : 8;
+            if (cmdBuffer.length === commonAt + 1 && /^\$[a-zA-Z0-9_]+$/.test(cmdBuffer[2]) && this.gui.formalSystem.deductions[idx]) { cmdBuffer.push(idx); this.execCmdBuffer(); return; }
+            if (cmdBuffer.length >= 3 && cmdBuffer.length < commonAt && this.gui.formalSystem.deductions[idx]) { cmdBuffer.push(idx); this.execCmdBuffer(); }
             else this.replaceActionInputFromClick(inserted);
             return;
         }

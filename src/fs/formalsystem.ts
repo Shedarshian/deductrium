@@ -972,7 +972,7 @@ export class FormalSystem {
             const target = matchTable[deduction.induction.targetName];
             if (!target) throw new Error("缺少归纳目标公式");
             const start = this.propositions.length;
-            const index = this.model.induct(property, target, deduction.induction.rules, conditionIdxs, mode.quantified);
+            const index = this.model.induct(property, target, deduction.induction.rules, conditionIdxs, mode.quantified, mode.existentialQuantified);
             if (!astmgr.equal(this.propositions[index].value, replacedConclusion)) throw new Error("归纳实例证明与所声明的结论不一致");
             if (!inlineMode) {
                 this.propositions.splice(start);
