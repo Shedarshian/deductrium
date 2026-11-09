@@ -44,7 +44,7 @@ const replaceArr2 = replaceArr1.slice(0).reverse();
 
 export class GameSaveLoad {
     storageKey = "deductrium-save";
-    constructor(gamemode: "survival" | "creative") {
+    constructor(private readonly gamemode: "survival" | "creative") {
         if (gamemode === "creative") {
             this.storageKey = "deductrium-creative-save";
             document.getElementById("gamemode").innerText = TR("[创造模式]");
@@ -57,6 +57,7 @@ export class GameSaveLoad {
         } else {
             document.getElementById("gamemode").innerText = TR("[生存模式]");
         }
+        this.storageKey += "-model-theory";
     }
     stateChangeTimer: number | boolean = false;
     timeOut = 3000;
@@ -167,13 +168,13 @@ export class GameSaveLoad {
             json = json.replaceAll(a, b);
         }
         json = Shuffle.replaceZh(json);
-        let randomFunction = new Rnd(this.storageKey === "deductrium-save" ? json.length : (json.length - 1));
+        let randomFunction = new Rnd(this.gamemode === "survival" ? json.length : (json.length - 1));
         // console.log(json);
         const l78z = Shuffle.shuffleArray(Array.from(json), randomFunction);
         return l78z.join("");
     }
     deserializeStr(str: string) {
-        let randomFunction = new Rnd(this.storageKey === "deductrium-save" ? str.length : (str.length - 1));
+        let randomFunction = new Rnd(this.gamemode === "survival" ? str.length : (str.length - 1));
         str = Shuffle.recoverZh(Shuffle.shuffleArrayReverse(Array.from(str), randomFunction));
         for (const [a, b] of replaceArr2) {
             str = str.replaceAll(b, a);
