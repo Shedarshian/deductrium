@@ -1,0 +1,72 @@
+name: Publish both game versions
+
+on:
+  push:
+    branches: [main, feature/model-theory]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: combined-github-pages
+  cancel-in-progress: false
+
+jobs:
+  assemble:
+    if: github.repository == 'Shedarshian/deductrium'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Assemble current main and model-theory versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p _site/model-theory
+          git archive origin/main index.html gui.css js src readme.md readme_en.md | tar -x -C _site
+          git archive origin/feature/model-theory index.html gui.css js src readme.md readme_en.md | tar -x -C _site/model-theory
+          touch _site/.nojekyll
+          node -e 'const fs = require("fs"); const cp = require("child_process"); fs.writeFileSync("_site/versions.json", JSON.stringify({main: cp.execSync("git rev-parse origin/main", {encoding: "utf8"}).trim(), modelTheory: cp.execSync("git rev-parse origin/feature/model-theory", {encoding: "utf8"}).trim()}, null, 2) + "\n")'
+
+      - name: Update the generated gh-pages branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git show-ref --verify --quiet refs/remotes/origin/gh-pages; then
+            git worktree add -B gh-pages publish-tree origin/gh-pages
+          else
+            git worktree add --detach publish-tree HEAD
+            git -C publish-tree switch --orphan gh-pages
+          fi
+          rsync -a --delete --exclude=.git _site/ publish-tree/
+          git -C publish-tree config user.name 'github-actions[bot]'
+          git -C publish-tree config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C publish-tree add --all
+          if ! git -C publish-tree diff --cached --quiet; then
+            git -C publish-tree commit -m '汇集正式版与模型论版本'
+            git -C publish-tree push origin HEAD:gh-pages
+          fi
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+          include-hidden-files: true
+
+  deploy:
+    needs: assemble
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish the combined site
+        id: deployment
+        uses: actions/deploy-pages@v4
