@@ -5,7 +5,7 @@ import { ASTParser } from "./astparser.js";
 import { TR } from "../lang.js";
 import { ConstrainSolver, RuleParser, RuleTree } from "./metarule.js";
 import { containsModelOperation, ModelKind, ModelOperations, templateNames, InductionRecipe } from "./model.js";
-export type ModelUnfoldStep = { path: number[]; target: AST };
+export type ModelUnfoldStep = { path: number[]; target: AST; nfPrefixes?: number[] };
 export type DeductionStep = { conditionIdxs: number[], deductionIdx: string, replaceValues: AST[], model?: ModelUnfoldStep, generalize?: AST }
 export type Deduction = { value: AST, conditions: AST[], conclusion: AST, replaceNames: string[], replaceTypes: { [replvar: string]: boolean }, from: string, steps?: DeductionStep[], tempvars: Set<string>, induction?: InductionRecipe };
 export type MetaRule = { value: AST, conditions: AST[], conclusions: AST[], replaceNames: string[], conditionDeductionIdxs: number[], from: string };
@@ -50,18 +50,67 @@ export class FormalSystem {
     hasModelProof(d: Deduction, seen = new Set<Deduction>()): boolean {
         if (!d || seen.has(d)) return false;
         seen.add(d);
-        return !!d.induction || !!d.steps?.some(s => !!s.model || !!s.generalize || [".modelunfold", ".modelgeneralize"].includes(s.deductionIdx) || this.hasModelProof(this.deductions[s.deductionIdx], seen));
+        return !!d.induction || !!d.steps?.some(s => !!s.model || !!s.generalize || [".modelunfold", ".modelgeneralize"].includes(s.deductionIdx) ||
+            d.from.endsWith("*") && !this.deductions[s.deductionIdx] || this.hasModelProof(this.deductions[s.deductionIdx], seen));
     }
-    private assertLegacyMetaInput(name: string) {
-        if (this.hasModelProof(this.generateDeduction(name))) throw new Error("此元规则尚不能转换含模型展开步骤的宏；请直接应用该宏并重放核验");
-        const seen = new Set<Deduction>();
-        const templates = (d: Deduction): boolean => {
-            if (!d || seen.has(d)) return false;
-            seen.add(d);
-            return containsModelOperation(d.value) || templateNames(d.value).size > 0 ||
-                !!d.steps?.some(s => s.replaceValues.some(a => containsModelOperation(a) || templateNames(a).size > 0) || templates(this.deductions[s.deductionIdx]));
+    private assertModelMetaInput(name: string, allowTemplates = true) {
+        const seen = new Set<Deduction>(), active = new Set<Deduction>();
+        let budget = 4096;
+        const inspect = (d: Deduction) => {
+            if (!d) throw new Error("元操作缺少依赖规则");
+            if (active.has(d) || active.size >= 128) throw new Error("元操作依赖循环或深度超限");
+            if (seen.has(d)) return;
+            if (--budget < 0) throw new Error("元操作依赖检查超限");
+            seen.add(d); active.add(d);
+            if (d.induction) throw new Error("请先将结构归纳实例化并录制实际证明，再使用该元操作");
+            if (!allowTemplates && templateNames(d.value).size) throw new Error("此元操作的约束求解暂不支持未绑定谓词或列表模板，请先实例化");
+            for (const step of d.steps ?? []) {
+                if (!allowTemplates && step.replaceValues.some(a => templateNames(a).size)) throw new Error("此元操作暂不支持证明内部的未绑定谓词或列表模板");
+                inspect(this.generateDeduction(step.deductionIdx));
+            }
+            active.delete(d);
         };
-        if (templates(this.deductions[name])) throw new Error("此旧元规则尚不能转换包含模型语法、谓词或列表模板的规则；请先实例化并显式展开");
+        inspect(this.generateDeduction(name));
+        return [...seen].some(d => d.steps?.some(s => !!s.generalize));
+    }
+    private defaultReplaceValues(d: Deduction): AST[] {
+        const kinds = templateNames(d.value);
+        return d.replaceNames.map(name => ({ type: kinds.get(name) === "predicate" ? "predref" : kinds.get(name) === "list" ? "arglist" : "replvar", name }));
+    }
+    private copyMetaStep(step: DeductionStep, conditionIdxs: number[], table: ReplvarMatchTable = {}, prefix: number[] = []): DeductionStep {
+        const replace = (a: AST) => { const result = astmgr.clone(a); astmgr.replaceByMatchTable(result, table); return result; };
+        const nfPrefixes = [...(prefix.length ? [prefix.length] : []), ...(step.model?.nfPrefixes ?? []).map(i => i + prefix.length)];
+        return { deductionIdx: step.deductionIdx, conditionIdxs, replaceValues: step.replaceValues.map(replace),
+            model: step.model ? { path: [...prefix, ...step.model.path], target: replace(step.model.target), nfPrefixes: nfPrefixes.length ? [...new Set(nfPrefixes)] : undefined } : undefined,
+            generalize: step.generalize ? replace(step.generalize) : undefined };
+    }
+    private liftModelGeneralization(step: DeductionStep, source: number, quantified: boolean, table: ReplvarMatchTable): number {
+        const variable = astmgr.clone(step.generalize);
+        astmgr.replaceByMatchTable(variable, table);
+        const generalized = this.generalizeModel(source, variable);
+        if (quantified) return this.deduct({ deductionIdx: ".Vs", conditionIdxs: [generalized], replaceValues: [] });
+        const implication = this.propositions[source].value;
+        if (implication.type !== "sym" || implication.name !== ">") throw new Error("概括提升缺少蕴含上下文");
+        const equivalence = this.deduct({ deductionIdx: ".Vnf>", conditionIdxs: [], replaceValues: [variable, implication.nodes[0], implication.nodes[1]] });
+        return this.deduct({ deductionIdx: "<<.<>1", conditionIdxs: [equivalence, generalized], replaceValues: [] });
+    }
+    private conditionGeneralizingProof(idx: string, d: Deduction, antecedent: AST, from: string): string {
+        // Discharge the original assumptions first. The new antecedent may
+        // contain the generalized variable, so generalizing S>B directly is invalid.
+        const old = this.propositions, fast = this.fastmetarules;
+        try {
+            this.fastmetarules += "<c>";
+            this.propositions = [];
+            const conditions = d.conditions.map(c => this.addHypothese({ type: "sym", name: ">", nodes: [antecedent, c] }));
+            let theorem = idx;
+            for (let i = 0; i < d.conditions.length; i++) theorem = this.metaDeductTheorem(theorem, "元规则生成*");
+            const rule = this.generateDeduction(theorem);
+            if (rule.conditions.length) throw new Error("条件提升未能解除原证明假设");
+            const proved = this.deduct({ deductionIdx: theorem, conditionIdxs: [], replaceValues: this.defaultReplaceValues(rule) });
+            let current = this.deduct({ deductionIdx: "<a1", conditionIdxs: [proved], replaceValues: [antecedent] });
+            for (const hypothesis of conditions) current = this.deduct({ deductionIdx: "cmp", conditionIdxs: [current, hypothesis], replaceValues: [] });
+            return this.addMacro("c" + idx, from);
+        } finally { this.propositions = old; this.fastmetarules = fast; }
     }
     private protectModelDefinitions(exclude: string) {
         if (Object.entries(this.deductions).some(([name, d]) => name !== exclude &&
@@ -441,7 +490,7 @@ export class FormalSystem {
                     return newv;
                 }),
                 deductionIdx: step.deductionIdx,
-                model: step.model ? { path: step.model.path.slice(), target: astmgr.clone(step.model.target) } : undefined,
+                model: step.model ? { path: step.model.path.slice(), target: astmgr.clone(step.model.target), nfPrefixes: step.model.nfPrefixes?.slice() } : undefined,
                 generalize: step.generalize ? astmgr.clone(step.generalize) : undefined
             });
         }
@@ -577,7 +626,6 @@ export class FormalSystem {
             if (!unlocked.includes(cmd) && cmd !== "v") throw "null";
             const subRuleName = ruleparser.stringify(tree[1]);
             this.generateDeductionByToken(tree[1], subRuleName);
-            if (this.hasModelProof(this.deductions[subRuleName])) throw new Error("含模型展开步骤的宏暂不能转换为快速元规则；请直接应用并重新核验");
             return this.deductions[fn.bind(this)(subRuleName, from)];
         }
         if (tree[0] === ":") {
@@ -589,7 +637,6 @@ export class FormalSystem {
                 tempvar
             ));
             const d2name = d1names.pop();
-            if ([...d1names, d2name].some(n => this.hasModelProof(this.deductions[n]))) throw new Error("含模型展开步骤的宏暂不能使用组合元规则");
             return this.deductions[this.metaCombineTheorem(d1names, d2name, from)];
         }
         if (tree.length === 1) {
@@ -863,9 +910,9 @@ export class FormalSystem {
             if (step.deductionIdx !== ".modelunfold" || step.conditionIdxs.length !== 1 || step.replaceValues.length) throw new Error("模型展开步骤格式错误");
             const index = step.conditionIdxs[0];
             if (!Number.isInteger(index) || index < 0 || !this.propositions[index]) throw new Error("模型展开引用了无效定理");
-            const value = this.model.unfold(this.propositions[index].value, step.model.path, step.model.target, true);
+            const value = this.model.unfold(this.propositions[index].value, step.model.path, step.model.target, true, step.model.nfPrefixes);
             if (partialTest) return;
-            return this.propositions.push({ value, from: { ...step, model: { path: step.model.path.slice(), target: astmgr.clone(step.model.target) } } }) - 1;
+            return this.propositions.push({ value, from: { ...step, model: { path: step.model.path.slice(), target: astmgr.clone(step.model.target), nfPrefixes: step.model.nfPrefixes?.slice() } } }) - 1;
         }
         const { conditionIdxs, deductionIdx, replaceValues } = step;
         const deduction = this.generateDeduction(deductionIdx);
@@ -1026,7 +1073,7 @@ export class FormalSystem {
                     const target = astmgr.clone(substep.model.target);
                     this.replaceTempVar(target, tempvars);
                     astmgr.replaceByMatchTable(target, matchTable);
-                    model = { path: substep.model.path.slice(), target };
+                    model = { path: substep.model.path.slice(), target, nfPrefixes: substep.model.nfPrefixes?.slice() };
                 }
                 let generalize: AST;
                 if (substep.generalize) {
@@ -1108,7 +1155,7 @@ export class FormalSystem {
         d.conditions.forEach(dcond => this.addHypothese(dcond));
         this.deduct({
             deductionIdx, conditionIdxs: d.conditions.map((v, idx) => idx),
-            replaceValues: d.replaceNames.map(str => ({ type: "replvar", name: str }))
+            replaceValues: this.defaultReplaceValues(d)
         }, inlineMode);
     }
     private _findReplNameInRule(deductionIdx: string) {
@@ -1123,8 +1170,21 @@ export class FormalSystem {
         if (deductionIdx) {
             const d = this.deductions[deductionIdx];
             if (!d) throw TR("无法生成中间步骤推理规则：") + deductionIdx;
-            for (const c of d.conditions) astmgr.getVarNames(c, p, /^\$/);
-            astmgr.getVarNames(d.conclusion, p, /^\$/);
+            const seen = new Set<Deduction>();
+            let budget = 4096;
+            const collect = (rule: Deduction) => {
+                if (!rule || seen.has(rule)) return;
+                if (--budget < 0) throw new Error("元操作新鲜变量分析超限");
+                seen.add(rule);
+                astmgr.getVarNames(rule.value, p, /^\$/);
+                for (const step of rule.steps ?? []) {
+                    step.replaceValues.forEach(a => astmgr.getVarNames(a, p, /^\$/));
+                    if (step.model) astmgr.getVarNames(step.model.target, p, /^\$/);
+                    if (step.generalize) astmgr.getVarNames(step.generalize, p, /^\$/);
+                    collect(this.deductions[step.deductionIdx]);
+                }
+            };
+            collect(d);
         }
         while (p.has(name)) {
             name = "$" + (i++);
@@ -1132,7 +1192,7 @@ export class FormalSystem {
         return { type: "replvar", name };
     }
     metaQuantifyAxiomSchema(deductionIdx: string, from: string) {
-        this.assertLegacyMetaInput(deductionIdx);
+        this.assertModelMetaInput(deductionIdx);
         const d = this.generateDeduction(deductionIdx);
         if (!d) throw TR(`推理规则 `) + deductionIdx + TR(` 不存在`);
         if (d.conditions?.length) throw TR("无法匹配带条件的推理规则");
@@ -1158,7 +1218,7 @@ export class FormalSystem {
     }
 
     metaExistTheorem(idx: string, from: string) {
-        this.assertLegacyMetaInput(idx);
+        this.assertModelMetaInput(idx);
         const d = this.generateDeduction(idx);
         if (d.conditions.length !== 1) throw TR("匹配条件推理规则($$0 ⊢ $$1)失败");
         if (this.deductions["e" + idx]) return "e" + idx;
@@ -1175,9 +1235,14 @@ export class FormalSystem {
                 ]
             }); pidx++;
             const vd = this.generateDeduction(("v>" + idx).replace("><", ""));
+            const quantifiedValues = this.defaultReplaceValues(vd);
+            const bound = vd.conclusion.type === "sym" && vd.conclusion.name === "V" ? vd.conclusion.nodes[0] : null;
+            const position = bound ? vd.replaceNames.indexOf(bound.name) : -1;
+            if (position < 0) throw new Error("存在提升无法识别全称步骤的变量参数");
+            quantifiedValues[position] = s;
             this.deduct({
                 deductionIdx: ("v>" + idx).replace("><", ""),
-                replaceValues: vd.replaceNames.map(e => ({ type: "replvar", name: e })),
+                replaceValues: quantifiedValues,
                 conditionIdxs: []
             }); pidx++;
             this.deduct({
@@ -1194,7 +1259,7 @@ export class FormalSystem {
         }
     }
     metaConditionUniversalTheorem(idx: string, from: string) {
-        this.assertLegacyMetaInput(idx);
+        this.assertModelMetaInput(idx);
         // mp
         if (this.deductions["v" + idx]) return "v" + idx;
         const num = idx.match(/^(v*)/)?.[1]?.length;
@@ -1225,14 +1290,18 @@ export class FormalSystem {
                 // avoid repeated deductions on the same prop (here reaching hyps are not possible)
                 if (isFinite(offsetTable[idx])) return offsetTable[idx];
                 // mp, axiom or macros
-                offsetTable[idx] = this.deduct({
-                    deductionIdx: sdidx, replaceValues: stepReplaceValues,
-                    conditionIdxs: step.conditionIdxs.map(id => generate(false, id >= 0 ? id : idx + id))
-                });
+                offsetTable[idx] = this.deduct(this.copyMetaStep(step, step.conditionIdxs.map(id => generate(false, id >= 0 ? id : idx + id)), SmatchTable));
                 return offsetTable[idx];
             }
             // avoid repeated deductions on the same prop (here includes hyps)
             if (isFinite(offsetCondTable[idx])) return offsetCondTable[idx];
+            if (step?.generalize) {
+                const parent = step.conditionIdxs[0];
+                return offsetCondTable[idx] = this.liftModelGeneralization(step, generate(true, parent >= 0 ? parent : idx + parent), true, SmatchTable);
+            }
+            if (step?.model) {
+                return offsetCondTable[idx] = this.deduct(this.copyMetaStep(step, step.conditionIdxs.map(id => generate(true, id >= 0 ? id : idx + id)), SmatchTable, [1]));
+            }
             if (!sd) throw TR("无法生成中间步骤推理规则：") + sdidx;
             return offsetCondTable[idx] = this.deduct({
                 deductionIdx: this.metaConditionUniversalTheorem(sdidx, ""),
@@ -1257,7 +1326,7 @@ export class FormalSystem {
         }
     }
     metaUniversalTheorem(idx: string, from: string) {
-        this.assertLegacyMetaInput(idx);
+        this.assertModelMetaInput(idx);
         if (this.deductions["u" + idx]) return "u" + idx;
         const d = this.generateDeduction(idx);
         if (!d) throw TR("条件中的推理规则不存在");
@@ -1292,14 +1361,18 @@ export class FormalSystem {
                 // avoid repeated deductions on the same prop (here reaching hyps are not possible)
                 if (isFinite(offsetTable[idx])) return offsetTable[idx];
                 // mp, axiom or macros
-                offsetTable[idx] = this.deduct({
-                    deductionIdx: sdidx, replaceValues: stepReplaceValues,
-                    conditionIdxs: step.conditionIdxs.map(id => generate(false, id >= 0 ? id : idx + id))
-                });
+                offsetTable[idx] = this.deduct(this.copyMetaStep(step, step.conditionIdxs.map(id => generate(false, id >= 0 ? id : idx + id)), replvarTable));
                 return offsetTable[idx];
             }
             // avoid repeated deductions on the same prop (here includes hyps)
             if (isFinite(offsetCondTable[idx])) return offsetCondTable[idx];
+            if (step?.generalize) {
+                const parent = step.conditionIdxs[0];
+                return offsetCondTable[idx] = this.liftModelGeneralization(step, generate(true, parent >= 0 ? parent : idx + parent), true, replvarTable);
+            }
+            if (step?.model) {
+                return offsetCondTable[idx] = this.deduct(this.copyMetaStep(step, step.conditionIdxs.map(id => generate(true, id >= 0 ? id : idx + id)), replvarTable, [1]));
+            }
             if (!sd) throw TR("无法生成中间步骤推理规则：") + sdidx;
             return offsetCondTable[idx] = this.deduct({
                 deductionIdx: this.metaConditionUniversalTheorem(sdidx, "元规则生成*"),
@@ -1315,7 +1388,7 @@ export class FormalSystem {
             d.conditions.forEach((c, id) => {
                 const newHyp = { type: "fn", name: "#nf", nodes: [c, s] };
                 this.addHypothese(newHyp);
-                try { this.assert.match(this.propositions[id].value, c, /^\$/, false, replvarTable, {}, null, []); } catch (e) {
+                try { this.assert.match(this.propositions[id].value, c, /^\$/, false, replvarTable, {}, containsModelOperation(c) || templateNames(c).size ? {} : null, []); } catch (e) {
                     throw TR(`向`) + TR(`第${id + 1}个`) + TR(`条件添加不自由断言时出现不一致：`) + e;
                 }
             });
@@ -1508,7 +1581,7 @@ export class FormalSystem {
         }
     }
     metaConditionTheorem(idx: string, from: string) {
-        this.assertLegacyMetaInput(idx);
+        const generalizing = this.assertModelMetaInput(idx);
         // mp
         if (this.deductions["c" + idx]) return "c" + idx;
         const d = this.generateDeduction(idx);
@@ -1534,6 +1607,7 @@ export class FormalSystem {
                 throw e;
             }
         }
+        if (generalizing) return this.conditionGeneralizingProof(idx, d, s, from);
         // ...A |- B
         const offsetTable = [];
         const offsetCondTable = [];
@@ -1546,14 +1620,18 @@ export class FormalSystem {
                 // avoid repeated deductions on the same prop (here reaching hyps are not possible)
                 if (isFinite(offsetTable[idx])) return offsetTable[idx];
                 // mp, axiom or macros
-                offsetTable[idx] = this.deduct({
-                    deductionIdx: sdidx, replaceValues: step.replaceValues,
-                    conditionIdxs: step.conditionIdxs.map(id => generate(false, id >= 0 ? id : idx + id))
-                });
+                offsetTable[idx] = this.deduct(this.copyMetaStep(step, step.conditionIdxs.map(id => generate(false, id >= 0 ? id : idx + id)), {}));
                 return offsetTable[idx];
             }
             // avoid repeated deductions on the same prop (here includes hyps)
             if (isFinite(offsetCondTable[idx])) return offsetCondTable[idx];
+            if (step?.generalize) {
+                const parent = step.conditionIdxs[0];
+                return offsetCondTable[idx] = this.liftModelGeneralization(step, generate(true, parent >= 0 ? parent : idx + parent), false, {});
+            }
+            if (step?.model) {
+                return offsetCondTable[idx] = this.deduct(this.copyMetaStep(step, step.conditionIdxs.map(id => generate(true, id >= 0 ? id : idx + id)), {}, [1]));
+            }
             if (!sd.conditions.length) {
                 const p0 = generate(false, idx);
                 return offsetCondTable[idx] = this.deduct({
@@ -1586,7 +1664,7 @@ export class FormalSystem {
         }
     }
     metaDeductTheorem(idx: string, from: string) {
-        this.assertLegacyMetaInput(idx);
+        this.assertModelMetaInput(idx);
         if (idx[0] === "<") { this.generateDeduction(idx.slice(1)); return idx.slice(1); }
         if (this.deductions[">" + idx]) return ">" + idx;
         const d = this.generateDeduction(idx);
@@ -1623,14 +1701,18 @@ export class FormalSystem {
                     }
                     condIdxs.push(n);
                 }
-                offsetTable[idx] = this.deduct({
-                    deductionIdx: sdidx, replaceValues: step.replaceValues,
-                    conditionIdxs: condIdxs
-                });
+                offsetTable[idx] = this.deduct(this.copyMetaStep(step, condIdxs));
                 return offsetTable[idx];
             }
             // avoid repeated deductions on the same prop (here includes hyps)
             if (isFinite(offsetCondTable[idx])) return offsetCondTable[idx];
+            if (step?.generalize) {
+                const parent = step.conditionIdxs[0];
+                return offsetCondTable[idx] = this.liftModelGeneralization(step, generate(true, parent >= 0 ? parent : idx + parent), false, {});
+            }
+            if (step?.model) {
+                return offsetCondTable[idx] = this.deduct(this.copyMetaStep(step, step.conditionIdxs.map(id => generate(true, id >= 0 ? id : idx + id)), {}, [1]));
+            }
             // B: B>B
             if (idx === d.conditions.length - 1) {
                 return offsetCondTable[idx] = this.deduct({ deductionIdx: ".i", conditionIdxs: [], replaceValues: [s] });
@@ -1673,7 +1755,7 @@ export class FormalSystem {
         }
     }
     metaInvDeductTheorem(idx: string, from: string) {
-        this.assertLegacyMetaInput(idx);
+        this.assertModelMetaInput(idx);
         // >a => a
         if (idx[0] === ">") { this.generateDeduction(idx.slice(1)); return idx.slice(1); }
         // a => <a
@@ -1689,7 +1771,7 @@ export class FormalSystem {
             const nhyp = this.addHypothese(ss1);
             const ss1_ss2 = this.deduct({
                 deductionIdx: idx, conditionIdxs: d.conditions.map((v, id) => id),
-                replaceValues: d.replaceNames.map(str => ({ type: "replvar", name: str }))
+                replaceValues: this.defaultReplaceValues(d)
             });
             this.deduct({ deductionIdx: "mp", replaceValues: [], conditionIdxs: [ss1_ss2, nhyp] });
             const ret = this.addMacro("<" + idx, from);
@@ -1716,7 +1798,7 @@ export class FormalSystem {
         return name;
     }
     metaCombineTheorem(idx1s: string[], idx2: string, from: string) {
-        [...idx1s.filter(n => n !== "#"), idx2].forEach(n => this.assertLegacyMetaInput(n));
+        [...idx1s.filter(n => n !== "#"), idx2].forEach(n => this.assertModelMetaInput(n, false));
         const name = ":" + idx1s.join(":") + "," + idx2;
         if (this.deductions[name]) return name;
         const d2 = this.generateDeduction(idx2);
@@ -1832,7 +1914,7 @@ export class FormalSystem {
         }
     }
     metaIffTheorem(idx: string, replaceValues: AST[], name: string, from: string, allowIFFT_RP: boolean) {
-        this.assertLegacyMetaInput(idx);
+        this.assertModelMetaInput(idx, false);
         if (replaceValues.some(v => templateNames(v).size)) throw new Error("互推替换尚不能处理未绑定谓词或列表模板，请先实例化");
         const d = this.generateDeduction(idx);
         if (!d) throw TR("推理规则不存在");

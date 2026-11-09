@@ -5,7 +5,7 @@ import { initFormalSystem } from "./initial.js";
 import { RuleParser, RuleTree } from "./metarule.js";
 import { ASTMgr } from "./astmgr.js";
 import { containsModelOperation, templateNames } from "./model.js";
-type SerializedOperation = { kind?: "unfold"; path: number[]; target: string } | { kind: "generalize"; variable: string };
+type SerializedOperation = { kind?: "unfold"; path: number[]; target: string; nfPrefixes?: number[] } | { kind: "generalize"; variable: string };
 type SerializedInduction = { kind: "formula-induction-v1"; template: string; targetName: string; rules: string[] };
 type SerilizedDeductionStep = [string, number[], string[], SerializedOperation?];
 type SerilizedDeduction = [string, string, SerilizedDeductionStep[], string[]?, SerializedInduction?];
@@ -25,7 +25,7 @@ export class SavesParser {
             s.replaceValues.map(v => astparser.stringifySaved(v))
         ];
         if (s.generalize) step.push({ kind: "generalize", variable: astparser.stringifySaved(s.generalize) });
-        else if (s.model) step.push({ path: s.model.path.slice(), target: astparser.stringifySaved(s.model.target) });
+        else if (s.model) step.push({ path: s.model.path.slice(), target: astparser.stringifySaved(s.model.target), ...(s.model.nfPrefixes ? { nfPrefixes: s.model.nfPrefixes.slice() } : {}) });
         return step;
     }
     serializeProposition(p: Proposition): SerilizedProposition {
@@ -39,7 +39,8 @@ export class SavesParser {
         if (operation?.kind === "generalize") result.generalize = astparser.parseSaved(operation.variable);
         else if (operation) {
             if (operation.kind !== undefined && operation.kind !== "unfold") throw new Error("未知证明操作");
-            result.model = { path: operation.path.slice(), target: astparser.parseSaved(operation.target) };
+            if (operation.nfPrefixes !== undefined && (!Array.isArray(operation.nfPrefixes) || operation.nfPrefixes.some(i => !Number.isInteger(i) || i < 0 || i > operation.path.length))) throw new Error("展开步骤的断言包装位置无效");
+            result.model = { path: operation.path.slice(), target: astparser.parseSaved(operation.target), nfPrefixes: operation.nfPrefixes?.slice() };
         }
         return result;
     }

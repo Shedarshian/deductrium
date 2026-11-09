@@ -1111,6 +1111,7 @@ export class AssertionSystem {
             this.match(ast.nodes[0], pattern, replNameReg, isItem, result, varTable, astAssertions, patternAssertions);
             // this way (Dict rather that Array) can avoid repeated assertions in ast
             astAssertions[parser.stringifyTight(ast.nodes[0])] = astmgr.clone(ast);
+            return;
         }
         if (pattern?.type === "replvar" && pattern.name.match(replNameReg)) {
             result[pattern.name] ??= astmgr.clone(ast);

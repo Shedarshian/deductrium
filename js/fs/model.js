@@ -530,10 +530,20 @@ export class ModelOperations {
             return this.meaning(this.one(a, isItem, true, budget), isItem, budget);
         return { ...a, nodes: a.nodes?.map((n, i) => this.meaning(n, this.fs.assert.getSubAstType(a, i, isItem), budget)) };
     }
-    unfold(source, path, expected, replay = false) {
+    unfold(source, path, expected, replay = false, nfPrefixes = []) {
         const result = mgr.clone(source);
         let node = result, item = false, underModel = false;
-        for (const i of path) {
+        if (!Array.isArray(nfPrefixes) || nfPrefixes.some(i => !Number.isInteger(i) || i < 0 || i > path.length))
+            this.fail("展开路径的断言包装位置无效");
+        for (let cursor = 0; cursor <= path.length; cursor++) {
+            // Meta lifting can introduce an unresolved #nf wrapper which later
+            // disappears on instantiation. Skip only at explicitly recorded boundaries.
+            if (nfPrefixes.includes(cursor))
+                while (this.fs.assert.getNfParams(node))
+                    node = node.nodes[0];
+            if (cursor === path.length)
+                break;
+            const i = path[cursor];
             if (!Number.isInteger(i) || i < 0 || !node.nodes?.[i] || (isModelOperation(node) && i !== 0))
                 this.fail("展开目标路径无效");
             underModel ||= isModelOperation(node);
