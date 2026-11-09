@@ -11,7 +11,7 @@
 
 `gh-pages` 是自动生成的发布分支，不用于开发或手动合并。每次更新同时汇集两个版本，避免只发布其中一个版本而覆盖另一个。`versions.json` 记录本次两个源提交。工作流串行执行，分支更新不使用强制推送。
 
-Pages 设置中的 Source 使用 **GitHub Actions**。工作流一方面更新 `gh-pages` 留存完整静态站点，另一方面通过官方 Pages artifact/deploy action 部署同一份内容，避免 `GITHUB_TOKEN` 推送发布分支不触发 Pages 构建的问题。`github-pages` 环境的发布分支须允许 `main` 和 `feature/model-theory`。
+Pages 设置中的 Source 使用 **GitHub Actions**。`pages.yml` 更新 `gh-pages` 留存完整静态站点，成功后通过 `workflow_run` 触发默认分支 `main` 中的 `pages-deploy.yml`，读取最新的 `gh-pages` 并通过官方 Pages artifact/deploy action 部署。两项工作流使用同一个串行组。这样避免 `GITHUB_TOKEN` 推送发布分支不触发 Pages 构建的问题，也保留 `github-pages` 环境只允许 `main` 部署的原有限制，无需给模型论分支扩大环境权限。
 
 正式版保持原存档键；模型论分支使用带 `-model-theory` 后缀的存档键。不会自动读取或迁移正式版进度。存档编码仍按生存/创造模式区分，与浏览器存储键解耦。语言设置可继续共享。
 

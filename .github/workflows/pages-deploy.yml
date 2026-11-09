@@ -1,0 +1,36 @@
+name: Deploy the combined site
+
+on:
+  workflow_run:
+    workflows: [Publish both game versions]
+    types: [completed]
+    branches: [main, feature/model-theory]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: combined-github-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.repository == 'Shedarshian/deductrium' && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: gh-pages
+          persist-credentials: false
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+      - name: Publish the combined site
+        id: deployment
+        uses: actions/deploy-pages@v4
