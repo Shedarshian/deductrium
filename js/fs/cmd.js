@@ -376,17 +376,29 @@ export class FSCmd {
     }
     execModelInduction() {
         const b = this.cmdBuffer;
-        const prompts = ["", "请输入性质公式模板，用 #slot 表示公式槽", "请输入要递归证明的具体公式（变量原子、~、>、V）",
+        const prompts = ["", "请输入性质公式模板，用 #slot 表示公式槽", "请输入具体目标公式；或输入 $A 形式的公式参数以创建可复用的结构归纳规则",
             "请选择属于原子分支的规则", "请选择相等原子分支的规则", "请选择否定构造分支的规则",
             "请选择蕴含构造分支的规则", "请选择全称构造分支的规则", "请输入共同前提定理编号，以逗号分隔；无前提输入 -"];
         if (b.length < 9) {
             this.gui.hintText.innerText = prompts[b.length];
             return;
         }
-        if (b.length !== 9)
+        if (b.length > 9 && !/^\$[a-zA-Z0-9_]+$/.test(b[2]))
             throw new Error("结构递归参数数量错误");
         const common = b[8].trim() === "-" ? [] : b[8].split(",").map(x => this.modelProposition(x.trim()));
-        const result = this.gui.formalSystem.model.induct(this.astparser.parse(b[1], true), this.astparser.parse(b[2], true), b.slice(3, 8), common);
+        const template = this.astparser.parse(b[1], true);
+        const target = this.astparser.parse(b[2], true);
+        if (target.type === "replvar" && /^\$[a-zA-Z0-9_]+$/.test(target.name)) {
+            if (!this.getInputNewDeductionPos(9))
+                return;
+            const rule = this.gui.formalSystem.model.createInduction(b[11], template, target.name, b.slice(3, 8), common.map(i => this.gui.formalSystem.propositions[i].value));
+            this.gui.addToDeductions(rule, b[9]);
+            this.clearCmdBuffer();
+            this.gui.updateDeductionList();
+            this.gui.hintText.innerText = "已生成结构归纳规则 " + rule + "；每次应用都会重新核验实际证明及量词侧条件";
+            return;
+        }
+        const result = this.gui.formalSystem.model.induct(template, target, b.slice(3, 8), common);
         this.clearCmdBuffer();
         this.gui.updatePropositionList(true);
         this.gui.hintText.innerText = `已逐分支组合出 p${result}；这是具体公式的证明，不代表已证明任意公式模式`;
@@ -662,6 +674,10 @@ export class FSCmd {
                     afterName = cmdBuffer[4];
                     break;
                 default:
+                    if (formalSystem.metaMacro[cmdBuffer[1]]) {
+                        newName = formalSystem.applyMetaMacro(cmdBuffer[1], cmdBuffer.slice(2));
+                        break;
+                    }
                     throw TR("很抱歉，该规则暂未被作者实现");
             }
             // if (!formalSystem.deductions[newName].from.endsWith("*")) formalSystem.deductions[newName].from += "*";
@@ -1094,6 +1110,11 @@ export class FSCmd {
             return;
         }
         if (cmdBuffer[0] === "mfinduct") {
+            if (cmdBuffer.length === 9 && /^\$[a-zA-Z0-9_]+$/.test(cmdBuffer[2]) && this.gui.formalSystem.deductions[idx]) {
+                cmdBuffer.push(idx);
+                this.execCmdBuffer();
+                return;
+            }
             if (cmdBuffer.length >= 3 && cmdBuffer.length <= 7 && this.gui.formalSystem.deductions[idx]) {
                 cmdBuffer.push(idx);
                 this.execCmdBuffer();

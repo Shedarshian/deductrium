@@ -1,6 +1,8 @@
 import { AST, ASTMgr } from "./astmgr.js";
 import { ASTParser } from "./astparser.js";
 import type { FormalSystem } from "./formalsystem.js";
+import type { Deduction } from "./formalsystem.js";
+export type InductionRecipe = { template: AST; targetName: string; rules: string[] };
 
 const mgr = new ASTMgr();
 const parser = new ASTParser();
@@ -51,6 +53,8 @@ export class ModelOperations {
     }
 
     private substitute(a: AST, replacements: Map<string, AST>): AST {
+        const present = mgr.getVarNames(a, new Set<string>(), null);
+        if (![...replacements.keys()].some(name => present.has(name))) return mgr.clone(a);
         if (a.type === "replvar") return mgr.clone(replacements.get(a.name) ?? a);
         if (isModelOperation(a)) {
             const domain = mgr.clone(a.nodes[1]);
@@ -63,12 +67,14 @@ export class ModelOperations {
             const bound = a.nodes[0];
             if (!this.plainVariable(bound)) this.fail("暂不支持带断言的绑定变量");
             const inner = new Map(replacements); inner.delete(bound.name);
+            const bodyIndex = a.name === "{|" || a.name === "|}" ? 2 : 1;
+            const bodyNames = mgr.getVarNames(a.nodes[bodyIndex], new Set<string>(), null);
+            for (const key of inner.keys()) if (!bodyNames.has(key)) inner.delete(key);
             for (const r of inner.values()) {
                 if (containsArgumentList(r)) this.fail("未绑定参数列表的自由变量不确定，不能穿过绑定变量替换");
                 const free = new Set<string>(); this.fs.assert.getFreeVars(r, free);
                 if (free.has(bound.name)) this.fail("替换可能捕获变量；请先展开并换名");
             }
-            const bodyIndex = a.name === "{|" || a.name === "|}" ? 2 : 1;
             return { ...a, nodes: a.nodes.map((n, i) => i === 0 ? mgr.clone(n) : this.substitute(n, i === bodyIndex ? inner : replacements)) };
         }
         return { ...a, nodes: a.nodes?.map(n => this.substitute(n, replacements)) };
@@ -153,22 +159,29 @@ export class ModelOperations {
     }
 
     predicateBinding(value: AST): AST {
+        if (value.type === "predref") {
+            if (value.nodes?.length) this.fail("裸谓词引用不能携带参数");
+            this.checkTemplateName(value.name);
+            return { type: "predicatebinding", name: value.name, nodes: [v("-1")] };
+        }
         if (value.type !== "replvar") this.fail("谓词参数需要一个已由 mprd 定义的具体谓词名");
         const d = this.inspectDefinition("dv" + value.name);
         return { type: "predicatebinding", name: d.name, nodes: [v(String(d.parameters.length))] };
     }
 
     argumentBinding(value: AST): AST {
+        if (value.type === "arglist" && !value.nodes?.length && /^\.\.\.\$[a-z_][a-z0-9_]*$/.test(value.name)) return { type: "argbinding", name: "", nodes: [mgr.clone(value)] };
         if (value.type !== "fn" || !["#args", "("].includes(value.name)) this.fail("参数列表请输入 #args(t1,t2,...)；空列表为 #args()");
         const types = {};
-        for (const term of value.nodes) {
-            if (containsArgumentList(term)) this.fail("具体参数列表不能再包含未绑定列表");
+        for (const [i, term] of value.nodes.entries()) {
+            if (term.type === "arglist" && !term.nodes?.length && i === value.nodes.length - 1 && /^\.\.\.\$[a-z_][a-z0-9_]*$/.test(term.name)) continue;
+            if (containsArgumentList(term)) this.fail("参数列表只能在末尾保留一个抽象列表");
             this.fs.assert.checkGrammer(term, "i"); this.fs.assert.getReplVarsType(term, types, true);
         }
         return { type: "argbinding", name: "", nodes: value.nodes.map(t => mgr.clone(t)) };
     }
     private bindingInput(value: AST): AST {
-        if (value.type === "predicatebinding") return v(value.name);
+        if (value.type === "predicatebinding") return { type: value.name.startsWith('"') ? "predref" : "replvar", name: value.name };
         if (value.type === "argbinding") return fn("#args", ...value.nodes.map(t => mgr.clone(t)));
         return mgr.clone(value);
     }
@@ -379,7 +392,7 @@ export class ModelOperations {
             return sym(body.name, ...body.nodes.map(n => sat(n, domain)));
         }
         if (body.type === "sym" && ["V", "E"].includes(body.name) && body.nodes?.length === 2) {
-            if (!this.plainVariable(body.nodes[0])) this.fail("量词展开需要确定的普通绑定变量");
+            if (!this.plainVariable(body.nodes[0]) && !(body.nodes[0].type === "replvar" && /^\$[a-zA-Z0-9_]+$/.test(body.nodes[0].name))) this.fail("量词展开需要普通变量或位于绑定位置的变量模板");
             if (!semantic && body.name === "E" && !modelSyntaxOptions.unfoldExists) this.fail("存在量词的直接展开已关闭");
             return this.quantify(body, domain);
         }
@@ -416,50 +429,148 @@ export class ModelOperations {
         return result;
     }
 
-    /** Finite proof construction; it does NOT assert an unproved schema for all formulas. */
-    induct(template: AST, target: AST, rules: string[], common: number[]): number {
-        if (rules.length !== 5) this.fail("依次提供属于、相等、否定、蕴含、全称五个分支规则");
-        if (common.some(i => !Number.isInteger(i) || i < 0 || !this.fs.propositions[i])) this.fail("共同前提定理编号无效");
+    private property(template: AST, formula: AST): AST {
+        return this.substitute(template, new Map([["#slot", formula]]));
+    }
+
+    private applyBranch(rule: string, goal: AST, available: number[], budget: { left: number }): number {
+        this.fs.assert.checkGrammer(goal, "p");
+        const d = this.fs.generateDeduction(rule);
+        if (!d) this.fail("结构归纳分支规则不存在：" + rule);
+        const initial: { [key: string]: AST } = {};
+        const types: { [key: string]: boolean } = {};
+        this.fs.assert.match(goal, d.conclusion, /^\$/, false, initial, types, null, []);
+        const search = (n: number, table: { [key: string]: AST }, selected: number[]): number => {
+            if (--budget.left < 0) this.fail("归纳分支匹配预算超限");
+            if (n === d.conditions.length) {
+                if (d.replaceNames.some(x => !table[x])) this.fail("分支仍有无法确定的参数");
+                const index = this.fs.deduct({ deductionIdx: rule, conditionIdxs: selected,
+                    replaceValues: d.replaceNames.map(x => this.bindingInput(table[x])) });
+                if (!mgr.equal(this.fs.propositions[index].value, goal)) this.fail("归纳分支实际结论与目标不符");
+                return index;
+            }
+            let last: unknown;
+            for (const index of available) {
+                const copy = Object.fromEntries(Object.entries(table).map(([k, a]) => [k, mgr.clone(a)]));
+                try { this.fs.assert.match(this.fs.propositions[index].value, d.conditions[n], /^\$/, false, copy, { ...types }, null, []); }
+                catch { continue; }
+                const before = this.fs.propositions.slice();
+                try { return search(n + 1, copy, [...selected, index]); }
+                catch (e) { this.fs.propositions = before; last = e; if (budget.left < 0) throw e; }
+            }
+            this.fail("分支前提或侧条件不能由子式结果和指定共同前提满足" + (last ? "：" + last : ""));
+        };
+        return search(0, initial, []);
+    }
+
+    private checkProperty(template: AST, generic: boolean) {
         const types = this.fs.assert.getReplVarsType(template, {}, false);
         if (types["#slot"] !== false) this.fail("性质模板必须在公式位置包含 #slot");
+        const walk = (a: AST, bound: boolean) => {
+            if (a.type === "replvar" && a.name.startsWith("#") && a.name !== "#slot") this.fail("性质模板不能含证明局部变量");
+            if (generic && a.type === "replvar" && a.name === "#slot" && bound) this.fail("通用归纳的公式槽不能位于对象量词的作用域内");
+            if (generic && a.type === "fn" && a.name.startsWith("#") && !isModelOperation(a)) this.fail("通用性质模板不能将系统断言当成公式槽的性质");
+            a.nodes?.forEach((n, i) => walk(n, bound || a.type === "sym" && ["V", "E", "E!", "{|", "|}"].includes(a.name) && i === (a.name === "{|" || a.name === "|}" ? 2 : 1)));
+        };
+        walk(template, false);
+    }
+
+    /** Verify schematic branches with fresh rigid metavariables, not sampled formulas. */
+    validateInduction(recipe: InductionRecipe, common: AST[]): { quantified: boolean } {
+        if (!recipe || !/^\$[a-zA-Z0-9_]+$/.test(recipe.targetName) || !Array.isArray(recipe.rules) || recipe.rules.length !== 5 || recipe.rules.some(r => typeof r !== "string" || !r)) this.fail("结构归纳规则的配方无效");
+        if (!Array.isArray(common) || common.length > 1024) this.fail("归纳共同前提数量超限");
+        this.checkProperty(recipe.template, true);
+        const names = mgr.getVarNames(recipe.template, new Set<string>(), null);
+        for (const c of common) {
+            this.fs.assert.checkGrammer(c, "p");
+            mgr.getVarNames(c, names, null);
+            const local = (a: AST): boolean => a.type === "replvar" && a.name.startsWith("#") || !!a.nodes?.some(local);
+            if (local(c)) this.fail("共同前提不能依赖证明局部变量或 #slot");
+        }
+        if (names.has(recipe.targetName)) this.fail("目标公式参数不能已在性质模板或共同前提中出现");
+        const visited = new Set<Deduction>();
+        let dependencyBudget = 4096;
+        const inspect = (d: Deduction) => {
+            if (!d) this.fail("归纳分支缺少依赖规则");
+            if (visited.has(d)) return;
+            if (--dependencyBudget < 0) this.fail("分支依赖分析预算超限");
+            visited.add(d);
+            if (d.induction) this.fail("归纳分支暂不能依赖另一条结构归纳生成规则");
+            mgr.getVarNames(d.value, names, null);
+            d.steps?.forEach(step => {
+                step.replaceValues.forEach(a => mgr.getVarNames(a, names, null));
+                if (step.model) mgr.getVarNames(step.model.target, names, null);
+                if (step.generalize) mgr.getVarNames(step.generalize, names, null);
+                inspect(this.fs.generateDeduction(step.deductionIdx));
+            });
+        };
+        recipe.rules.forEach(r => inspect(this.fs.generateDeduction(r)));
+        let serial = 0;
+        const fresh = () => { let name: string; do { name = "$mi_probe_" + serial++; } while (names.has(name)); names.add(name); return v(name); };
+        const [a, b, x, y] = [fresh(), fresh(), fresh(), fresh()];
+        const cases = [sym("@", x, y), sym("=", x, y), sym("~", a), sym(">", a, b), sym("V", x, a)];
+        const children: AST[][] = [[], [], [a], [a, b], [a]];
+        const old = this.fs.propositions;
+        const budget = { left: 16384 };
+        let quantified = false;
+        try {
+            for (let i = 0; i < 5; i++) {
+                const run = (quantifiedIH: boolean) => {
+                    this.fs.propositions = [];
+                    const available = common.map(c => this.fs.addHypothese(c, true));
+                    children[i].forEach(child => {
+                        const ih = this.property(recipe.template, child);
+                        available.push(this.fs.addHypothese(quantifiedIH ? sym("V", mgr.clone(x), ih) : ih, true));
+                    });
+                    this.applyBranch(recipe.rules[i], this.property(recipe.template, cases[i]), available, budget);
+                };
+                try { run(false); }
+                catch (directError) {
+                    if (i !== 4 || budget.left < 0) throw new Error("第 " + (i + 1) + " 个通用分支未通过核验：" + directError);
+                    try { run(true); quantified = true; }
+                    catch (quantifiedError) { throw new Error("全称分支既不能由 T[A]，也不能由 Vx:T[A] 推出目标：" + quantifiedError); }
+                }
+            }
+            return { quantified };
+        } finally { this.fs.propositions = old; }
+    }
+
+    createInduction(name: string, template: AST, targetName: string, rules: string[], common: AST[]): string {
+        if (!/^[a-z_][a-z0-9_]*$/.test(name) || /^[acdempuv]/.test(name) || this.fs.deductions[name]) this.fail("归纳规则需要一个未占用的普通自定义规则名");
+        const recipe: InductionRecipe = { template: mgr.clone(template), targetName, rules: rules.slice() };
+        this.validateInduction(recipe, common);
+        const value: AST = { type: "meta", name: "⊢", nodes: [fn("#array", ...common.map(c => mgr.clone(c))), fn("#array", this.property(recipe.template, v(targetName)))] };
+        this.fs.addDeduction(name, value, "结构归纳规则（纯关系语言，逐实例核验量词侧条件）*");
+        this.fs.deductions[name].induction = recipe;
+        return name;
+    }
+
+    validateInductionDefinition(d: Deduction): { quantified: boolean } {
+        if (!d.induction || d.steps?.length || d.tempvars?.size) this.fail("结构归纳规则不能同时带普通宏步骤或局部变量");
+        const result = this.validateInduction(d.induction, d.conditions);
+        const goal = this.property(d.induction.template, v(d.induction.targetName));
+        this.fs.assert.checkGrammer(goal, "p");
+        if (!mgr.equal(goal, d.conclusion)) this.fail("归纳配方与所声明的规则结论不一致");
+        return result;
+    }
+
+    /** Elaborate each concrete instance into checked existing inference steps. */
+    induct(template: AST, target: AST, rules: string[], common: number[], quantified = false): number {
+        if (rules.length !== 5) this.fail("依次提供属于、相等、否定、蕴含、全称五个分支规则");
+        if (common.some(i => !Number.isInteger(i) || i < 0 || !this.fs.propositions[i])) this.fail("共同前提定理编号无效");
+        this.checkProperty(template, false);
         const before = this.fs.propositions.slice();
-        let budget = 4096;
-        const property = (a: AST) => this.substitute(template, new Map([["#slot", a]]));
+        const budget = { left: 4096 };
         const construct = (a: AST): number => {
-            if (--budget < 0) this.fail("结构递归预算超限");
+            if (--budget.left < 0) this.fail("结构递归预算超限");
             let branch: number; let children: AST[] = [];
             if (a.type === "sym" && ["@", "="].includes(a.name) && a.nodes?.length === 2 && a.nodes.every(x => this.plainVariable(x))) branch = a.name === "@" ? 0 : 1;
             else if (a.type === "sym" && a.name === "~" && a.nodes?.length === 1) { branch = 2; children = a.nodes; }
             else if (a.type === "sym" && a.name === ">" && a.nodes?.length === 2) { branch = 3; children = a.nodes; }
             else if (a.type === "sym" && a.name === "V" && a.nodes?.length === 2 && this.plainVariable(a.nodes[0])) { branch = 4; children = [a.nodes[1]]; }
             else return this.fail("归纳范围仅覆盖变量原子 x@y、x=y 及 ~、>、V；其余符号须先可靠消去");
-            const available = [...common, ...children.map(construct)];
-            const goal = property(a);
-            this.fs.assert.checkGrammer(goal, "p");
-            const d = this.fs.generateDeduction(rules[branch]);
-            const initial: { [key: string]: AST } = {};
-            const varTypes: { [key: string]: boolean } = {};
-            this.fs.assert.match(goal, d.conclusion, /^\$/, false, initial, varTypes, null, []);
-            const search = (n: number, table: { [key: string]: AST }, selected: number[]): number => {
-                if (--budget < 0) this.fail("分支匹配预算超限");
-                if (n === d.conditions.length) {
-                    if (d.replaceNames.some(x => !table[x])) this.fail("分支仍有无法确定的参数");
-                    const index = this.fs.deduct({ deductionIdx: rules[branch], conditionIdxs: selected,
-                        replaceValues: d.replaceNames.map(x => this.bindingInput(table[x])) });
-                    if (!mgr.equal(this.fs.propositions[index].value, goal)) this.fail("归纳分支实际结论与目标不符");
-                    return index;
-                }
-                for (const index of available) {
-                    const copy = Object.fromEntries(Object.entries(table).map(([k, a]) => [k, mgr.clone(a)]));
-                    try { this.fs.assert.match(this.fs.propositions[index].value, d.conditions[n], /^\$/, false, copy, { ...varTypes }, null, []); }
-                    catch { continue; }
-                    const length = this.fs.propositions.length;
-                    try { return search(n + 1, copy, [...selected, index]); }
-                    catch (e) { this.fs.propositions.splice(length); if (budget < 0) throw e; }
-                }
-                return this.fail("分支规则的前提无法由子式结果和指定的共同前提满足");
-            };
-            return search(0, initial, []);
+            const ih = children.map(construct).map(index => branch === 4 && quantified ? this.fs.generalizeModel(index, a.nodes[0]) : index);
+            return this.applyBranch(rules[branch], this.property(template, a), [...common, ...ih], budget);
         };
         try { return construct(target); }
         catch (e) { this.fs.propositions = before; throw e; }

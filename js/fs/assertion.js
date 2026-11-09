@@ -1130,11 +1130,9 @@ export class AssertionSystem {
             return;
         }
         if (pattern?.type === "predref") {
-            if (ast.type === "predref" && ast.name === pattern.name)
-                return;
             const binding = this.modelPredicateBinding?.(ast);
-            if (!binding || binding.nodes[0].name !== "1")
-                throw new Error("论域模板只能匹配具体的一元 mprd 谓词");
+            if (!binding || (!binding.name.startsWith('"') && binding.nodes[0].name !== "1"))
+                throw new Error("论域模板只能匹配一元 mprd 谓词或抽象论域引用");
             if (result[pattern.name] && !astmgr.equal(result[pattern.name], binding))
                 throw new Error("同一谓词模板的绑定不一致");
             result[pattern.name] = binding;
@@ -1142,12 +1140,21 @@ export class AssertionSystem {
         }
         if (pattern?.type === "predtemplate") {
             if (ast.type === "predtemplate") {
-                if (ast.name !== pattern.name || ast.nodes.length !== pattern.nodes.length)
-                    throw new Error("抽象谓词模板的名称和列表结构必须一致");
+                if (ast.nodes.length !== pattern.nodes.length)
+                    throw new Error("抽象谓词模板的列表结构必须一致");
+                const binding = this.modelPredicateBinding({ type: "predref", name: ast.name });
+                if (result[pattern.name] && !astmgr.equal(result[pattern.name], binding))
+                    throw new Error("抽象谓词模板绑定不一致");
+                result[pattern.name] = binding;
                 for (let i = 0; i < ast.nodes.length; i++) {
                     if (ast.nodes[i].type === "arglist" || pattern.nodes[i].type === "arglist") {
-                        if (!astmgr.equal(ast.nodes[i], pattern.nodes[i]))
+                        if (ast.nodes[i].type !== "arglist" || pattern.nodes[i].type !== "arglist")
                             throw new Error("抽象参数列表不一致");
+                        const value = { type: "argbinding", name: "", nodes: [astmgr.clone(ast.nodes[i])] };
+                        const key = pattern.nodes[i].name;
+                        if (result[key] && !astmgr.equal(result[key], value))
+                            throw new Error("抽象参数列表绑定不一致");
+                        result[key] = value;
                     }
                     else
                         this.match(ast.nodes[i], pattern.nodes[i], replNameReg, true, result, varTable, astAssertions, patternAssertions);

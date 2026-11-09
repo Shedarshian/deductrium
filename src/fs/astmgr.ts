@@ -83,7 +83,9 @@ export class ASTMgr {
             if (a.type === "predref") {
                 const binding = matchResult[a.name];
                 if (!binding) return;
-                if (binding.type !== "predicatebinding" || binding.nodes[0].name !== "1") throw new Error("论域模板必须绑定一元谓词");
+                if (binding.type !== "predicatebinding") throw new Error("论域模板的绑定类别错误");
+                if (binding.name.startsWith('"')) { a.name = binding.name; return; }
+                if (binding.nodes[0].name !== "1") throw new Error("论域模板必须绑定一元谓词");
                 this.assign(a, { type: "replvar", name: binding.name }); return;
             }
             if (a.type === "predtemplate") {
@@ -101,7 +103,9 @@ export class ASTMgr {
                 a.nodes = expanded;
                 const binding = matchResult[a.name];
                 if (binding) {
-                    if (binding.type !== "predicatebinding" || expanded.some(n => n.type === "arglist") || expanded.length !== Number(binding.nodes[0].name)) throw new Error("谓词绑定与实际参数列表的元数不符");
+                    if (binding.type !== "predicatebinding") throw new Error("谓词绑定类别错误");
+                    if (binding.name.startsWith('"')) { a.name = binding.name; return; }
+                    if (expanded.some(n => n.type === "arglist") || expanded.length !== Number(binding.nodes[0].name)) throw new Error("谓词绑定与实际参数列表的元数不符");
                     a.type = "fn"; a.name = binding.name;
                 }
                 return;

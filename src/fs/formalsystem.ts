@@ -4,10 +4,10 @@ import { Proof } from "./proof.js";
 import { ASTParser } from "./astparser.js";
 import { TR } from "../lang.js";
 import { ConstrainSolver, RuleParser, RuleTree } from "./metarule.js";
-import { containsModelOperation, ModelKind, ModelOperations, templateNames } from "./model.js";
+import { containsModelOperation, ModelKind, ModelOperations, templateNames, InductionRecipe } from "./model.js";
 export type ModelUnfoldStep = { path: number[]; target: AST };
-export type DeductionStep = { conditionIdxs: number[], deductionIdx: string, replaceValues: AST[], model?: ModelUnfoldStep }
-export type Deduction = { value: AST, conditions: AST[], conclusion: AST, replaceNames: string[], replaceTypes: { [replvar: string]: boolean }, from: string, steps?: DeductionStep[], tempvars: Set<string> };
+export type DeductionStep = { conditionIdxs: number[], deductionIdx: string, replaceValues: AST[], model?: ModelUnfoldStep, generalize?: AST }
+export type Deduction = { value: AST, conditions: AST[], conclusion: AST, replaceNames: string[], replaceTypes: { [replvar: string]: boolean }, from: string, steps?: DeductionStep[], tempvars: Set<string>, induction?: InductionRecipe };
 export type MetaRule = { value: AST, conditions: AST[], conclusions: AST[], replaceNames: string[], conditionDeductionIdxs: number[], from: string };
 export type MetaMacro = { inputs: string[], output: RuleTree, from: string };
 export type Proposition = { value: AST, from: DeductionStep };
@@ -45,11 +45,12 @@ export class FormalSystem {
         // A safe identity descriptor for display and legacy bookkeeping. Actual
         // model steps are accepted only by deduct's separately checked branch.
         this.addDeduction(".modelunfold", parser.parse("$0⊢$0"), "模型定义展开");
+        this.addDeduction(".modelgeneralize", parser.parse("$0⊢$0"), "归纳量词概括");
     }
     hasModelProof(d: Deduction, seen = new Set<Deduction>()): boolean {
         if (!d || seen.has(d)) return false;
         seen.add(d);
-        return !!d.steps?.some(s => !!s.model || s.deductionIdx === ".modelunfold" || this.hasModelProof(this.deductions[s.deductionIdx], seen));
+        return !!d.induction || !!d.steps?.some(s => !!s.model || !!s.generalize || [".modelunfold", ".modelgeneralize"].includes(s.deductionIdx) || this.hasModelProof(this.deductions[s.deductionIdx], seen));
     }
     private assertLegacyMetaInput(name: string) {
         if (this.hasModelProof(this.generateDeduction(name))) throw new Error("此元规则尚不能转换含模型展开步骤的宏；请直接应用该宏并重放核验");
@@ -79,6 +80,29 @@ export class FormalSystem {
         this.model.unfold(source.value, target.path, target.node);
         return this.deduct({ deductionIdx: ".modelunfold", conditionIdxs: [proposition], replaceValues: [],
             model: { path: target.path.slice(), target: astmgr.clone(target.node) } });
+    }
+    generalizeModel(source: number, variable: AST): number {
+        return this.deduct({ deductionIdx: ".modelgeneralize", conditionIdxs: [source], replaceValues: [], generalize: astmgr.clone(variable) });
+    }
+    private generalizedValue(source: number, variable: AST): AST {
+        if (variable.type !== "replvar" || !/^[a-z_][a-z0-9_]*$/.test(variable.name) || this.assert.isConst(variable.name)) throw new Error("概括需要一个确定的普通变量");
+        const pending = [source], visited = new Set<number>();
+        let budget = 16384;
+        while (pending.length) {
+            if (--budget < 0) throw new Error("假设依赖分析预算超限");
+            const index = pending.pop();
+            if (!Number.isInteger(index) || index < 0 || !this.propositions[index]) throw new Error("概括引用的证明依赖无效");
+            if (visited.has(index)) continue;
+            visited.add(index);
+            const p = this.propositions[index];
+            if (!p.from) {
+                if (this.assert.nf(variable.name, p.value) !== 1) throw new Error("不能概括：变量 " + variable.name + " 可能自由出现在实际依赖的假设 p" + index + " 中");
+            } else for (const parent of p.from.conditionIdxs) {
+                if (!Number.isInteger(parent) || parent < 0 || parent >= index) throw new Error("概括依赖包含循环或前向引用");
+                pending.push(parent);
+            }
+        }
+        return { type: "sym", name: "V", nodes: [astmgr.clone(variable), astmgr.clone(this.propositions[source].value)] };
     }
     private ast2deduction(ast: AST): Deduction {
         this.assert.checkGrammer(ast, "d");
@@ -134,6 +158,7 @@ export class FormalSystem {
         if (this.getDeductionTokens(name).length > 1) return false; // this is composed, ignore it
         const composedDs = [];
         for (const [n, d] of Object.entries(this.deductions)) {
+            if (n !== name && d.induction?.rules.some(r => this.getdependency(name, r))) throw new Error("请先删除依赖此分支的归纳规则 " + n);
             if (!d.steps) continue;
             if (name === n) continue;
             if (this.getDeductionTokens(n).length > 1) {
@@ -180,6 +205,12 @@ export class FormalSystem {
         if (this.deductions[newname]) throw TR("规则名称 ") + newname + TR(" 已存在");
         const composedDs = [];
         for (const [n, d] of Object.entries(this.deductions)) {
+            if (d.induction) d.induction.rules = d.induction.rules.map(r => {
+                if (!this.getdependency(oldname, r)) return r;
+                const tree = this.getDeductionTokens(r);
+                ruleparser.replaceNameByName(tree, oldname, newname);
+                return ruleparser.stringify(tree);
+            });
             if (!d.steps) continue;
             if (oldname === n) continue;
             if (this.getDeductionTokens(n).length > 1) {
@@ -195,6 +226,10 @@ export class FormalSystem {
                     s.deductionIdx = ruleparser.stringify(tr);
                 }
             }
+        }
+        for (const [name, macro] of Object.entries(this.metaMacro)) {
+            ruleparser.replaceNameByName(macro.output, oldname, newname);
+            this.metaRules[name].value.nodes[1].nodes[0].name = ruleparser.stringify(macro.output);
         }
         for (const [n, p] of this.propositions.entries()) {
             const s = p.from;
@@ -253,6 +288,27 @@ export class FormalSystem {
         ast.nodes[1].nodes[0].type = "rule";
         ast.nodes[1].nodes[0].name = ruleparser.stringify(output);
         this.addMetaRule(name, ast, inputs.map((e, i) => i), [], from);
+    }
+    applyMetaMacro(name: string, inputs: string[]): string {
+        const macro = this.metaMacro[name];
+        if (!macro || inputs.length !== macro.inputs.length) throw new Error("元宏参数数量不符");
+        const bindings = new Map(macro.inputs.map((key, i) => {
+            if (!this.generateDeduction(inputs[i])) throw new Error("元宏输入规则不存在：" + inputs[i]);
+            return [key, this.getDeductionTokens(inputs[i])] as [string, RuleTree];
+        }));
+        let budget = 4096;
+        const expand = (tree: RuleTree, depth = 0): RuleTree => {
+            if (--budget < 0 || depth > 128) throw new Error("元宏展开预算超限");
+            if (tree.length === 1) {
+                const value = bindings.get(tree[0]);
+                return value ? JSON.parse(JSON.stringify(value)) : [tree[0]];
+            }
+            return [tree[0], ...(tree.slice(1) as RuleTree[]).map(t => expand(t, depth + 1))];
+        };
+        const output = expand(macro.output);
+        const result = ruleparser.stringify(output);
+        if (!this.generateDeduction(result)) throw new Error("元宏输出不是可执行的推理规则");
+        return result;
     }
     private _hasRpFn(m: AST) {
         if (m.type === "fn" && m.name === "#rp") {
@@ -385,7 +441,8 @@ export class FormalSystem {
                     return newv;
                 }),
                 deductionIdx: step.deductionIdx,
-                model: step.model ? { path: step.model.path.slice(), target: astmgr.clone(step.model.target) } : undefined
+                model: step.model ? { path: step.model.path.slice(), target: astmgr.clone(step.model.target) } : undefined,
+                generalize: step.generalize ? astmgr.clone(step.generalize) : undefined
             });
         }
         return this.addDeduction(name, {
@@ -795,6 +852,13 @@ export class FormalSystem {
         finally { if (guarded) this.activeModelProofs.delete(step.deductionIdx); }
     }
     private deductChecked(step: DeductionStep, inlineMode?: DeductInlineMode | ((step: DeductionStep, conclusion: AST) => DeductInlineMode), partialTest?: boolean) {
+        if (step.generalize) {
+            if (step.model || step.deductionIdx !== ".modelgeneralize" || step.conditionIdxs.length !== 1 || step.replaceValues.length) throw new Error("概括步骤格式错误");
+            const value = this.generalizedValue(step.conditionIdxs[0], step.generalize);
+            this.assert.checkGrammer(value, "p");
+            if (partialTest) return;
+            return this.propositions.push({ value, from: { ...step, generalize: astmgr.clone(step.generalize) } }) - 1;
+        }
         if (step.model) {
             if (step.deductionIdx !== ".modelunfold" || step.conditionIdxs.length !== 1 || step.replaceValues.length) throw new Error("模型展开步骤格式错误");
             const index = step.conditionIdxs[0];
@@ -808,6 +872,7 @@ export class FormalSystem {
         const errorMsg = TR(`规则 `) + deductionIdx + TR(` 推理失败:`);
         if (!deduction) throw errorMsg + TR("规则不存在");
         const { conditions, conclusion, replaceNames, steps, replaceTypes } = deduction;
+        if (deduction.induction && (conditionIdxs.length !== conditions.length || replaceValues.length !== replaceNames.length)) throw new Error("归纳规则的前提和参数必须与声明数量完全一致");
         const templateKinds = templateNames(deduction.value);
 
         // firstly, match condition, get matchtable ( partial initially provided by users)
@@ -842,6 +907,15 @@ export class FormalSystem {
         }
         replaceNames.forEach((replname: string, idx: number) => {
             if (templateKinds.get(replname) === "predicate") return;
+            if (templateKinds.get(replname) === "list") {
+                for (const value of matchTable[replname]?.nodes ?? []) {
+                    if (value.type === "arglist") continue;
+                    const term = astmgr.clone(value);
+                    this.assert.expand(term, true);
+                    this.assert.match(term, null, /^\$/, true, null, null, astAssertions, assertions);
+                }
+                return;
+            }
             const nast = astmgr.clone(replaceValues[idx]);
             this.assert.expand(nast, replaceTypes[replname]);
             this.assert.match(nast, null, /^\$/, replaceTypes[replname], null, null, astAssertions, assertions)
@@ -891,6 +965,22 @@ export class FormalSystem {
             throw errorMsg + TR(`结论中：`) + e;
         }
 
+        if (deduction.induction) {
+            const mode = this.model.validateInductionDefinition(deduction);
+            const property = astmgr.clone(deduction.induction.template);
+            astmgr.replaceByMatchTable(property, matchTable);
+            const target = matchTable[deduction.induction.targetName];
+            if (!target) throw new Error("缺少归纳目标公式");
+            const start = this.propositions.length;
+            const index = this.model.induct(property, target, deduction.induction.rules, conditionIdxs, mode.quantified);
+            if (!astmgr.equal(this.propositions[index].value, replacedConclusion)) throw new Error("归纳实例证明与所声明的结论不一致");
+            if (!inlineMode) {
+                this.propositions.splice(start);
+                return this.propositions.push({ value: replacedConclusion, from: step }) - 1;
+            }
+            return index;
+        }
+
         // if it isn't macro or not inineMode, done
 
         let netInlineMode = inlineMode;
@@ -938,7 +1028,13 @@ export class FormalSystem {
                     astmgr.replaceByMatchTable(target, matchTable);
                     model = { path: substep.model.path.slice(), target };
                 }
-                lastPos = this.deduct({ deductionIdx: substep.deductionIdx, replaceValues, conditionIdxs: replacedConditionIdxs, model }, netInlineMode === "deep" ? (guardedModelProof ? "deep" : inlineMode) : null);
+                let generalize: AST;
+                if (substep.generalize) {
+                    generalize = astmgr.clone(substep.generalize);
+                    this.replaceTempVar(generalize, tempvars);
+                    astmgr.replaceByMatchTable(generalize, matchTable);
+                }
+                lastPos = this.deduct({ deductionIdx: substep.deductionIdx, replaceValues, conditionIdxs: replacedConditionIdxs, model, generalize }, netInlineMode === "deep" ? (guardedModelProof ? "deep" : inlineMode) : null);
             } catch (e) {
                 // if one substep is wrong, remove newly added substeps from proplist
                 const substepErrMsg = errorMsg + TR(`子步骤`) + `${substepIdx + 1}(${substep.deductionIdx}` + TR(`)中 `) + e;
@@ -964,7 +1060,7 @@ export class FormalSystem {
         const { deductionIdx, conditionIdxs, replaceValues } = p.from;
         if (!this.deductions[deductionIdx]) this.deductions[deductionIdx] = this.generateDeduction(deductionIdx);
         const from = this.deductions[deductionIdx].from;
-        if (!this.deductions[deductionIdx].steps) throw TR(`该定理由来自<`) + TR(deductionIdx[0] === "v" ? TR("一阶逻辑公理模式") : from) + TR(`>的原子推理规则得到，无子步骤`);
+        if (!this.deductions[deductionIdx].steps && !this.deductions[deductionIdx].induction) throw TR(`该定理由来自<`) + TR(deductionIdx[0] === "v" ? TR("一阶逻辑公理模式") : from) + TR(`>的原子推理规则得到，无子步骤`);
         const hyps = conditionIdxs.map(c => this.propositions[c].value);
         this.removePropositions();
         // expandMode set true to skip local var check in addHypothese
@@ -974,11 +1070,16 @@ export class FormalSystem {
         }, "inline");
     }
     inlineMacroInProp(propositionIdx: number) {
+        const before = this.propositions.slice();
+        try { return this.inlineMacroInPropChecked(propositionIdx); }
+        catch (e) { this.propositions = before; throw e; }
+    }
+    private inlineMacroInPropChecked(propositionIdx: number) {
         const p = this.propositions[propositionIdx];
         if (!p.from) throw TR("该定理为假设，无推理步骤可展开");
         const { deductionIdx, conditionIdxs, replaceValues } = p.from;
         if (!this.deductions[deductionIdx]) this.deductions[deductionIdx] = this.generateDeduction(deductionIdx);
-        if (!this.deductions[deductionIdx].steps) throw TR(`该定理由来自<`) + TR(this.deductions[deductionIdx].from) + TR(`>的原子推理规则得到，无子步骤`);
+        if (!this.deductions[deductionIdx].steps && !this.deductions[deductionIdx].induction) throw TR(`该定理由来自<`) + TR(this.deductions[deductionIdx].from) + TR(`>的原子推理规则得到，无子步骤`);
         const suivant: Proposition[] = [];
         while (true) {
             const p1 = this.propositions.pop();
@@ -1001,6 +1102,7 @@ export class FormalSystem {
     expandMacroWithDefaultValue(deductionIdx: string, inlineMode: DeductInlineMode = "inline", expandAxiom?: boolean) {
         const d = this.deductions[deductionIdx] || this.generateDeduction(deductionIdx);
         if (!d) throw TR(`推理规则 `) + deductionIdx + TR(` 不存在`);
+        if (d.induction) throw new Error("请先实例化归纳规则，再查看或展开该定理的实际证明");
         if (!expandAxiom && !d.steps) throw TR(`无法展开原子推理规则`);
         this.removePropositions();
         d.conditions.forEach(dcond => this.addHypothese(dcond));
