@@ -1,5 +1,6 @@
 import { TR } from "../lang.js";
 import { AST, ASTMgr } from "./astmgr.js";
+import { containsModelOperation, isModelOperation } from "./model.js";
 const astmgr = new ASTMgr;
 const logicSyms = ["<>", ">", "~", "&", "|"];
 const quantSyms = ["E", "E!", "V"];
@@ -40,6 +41,7 @@ function eq(name1: string, name2: string): bool3 {
 }
 
 export class AssertionSystem {
+    modelDomainCheck: (domain: AST) => void;
     fns = new Set<string>;
     verbs = new Set<string>;
     consts = new Set<string>;
@@ -160,6 +162,7 @@ export class AssertionSystem {
     }
     // fussy check whether name is nofree in V* ast, exclusions can be provided for replvar name
     nf(name: string, ast: AST, quants: AST[] = [], nameIsNot?: Set<string>): bool3 {
+        if (isModelOperation(ast)) return this.nf(name, ast.nodes[0], quants, nameIsNot);
         const astName = this.getVarName(ast);
         // ast is var
         if (ast.type === "replvar") {
@@ -279,6 +282,10 @@ export class AssertionSystem {
     }
     // return a ReplvarTypeTable (or add to a existed one, throw error when conflits) for ast
     getReplVarsType(ast: AST, res: ReplvarTypeTable = {}, isItem: boolean, resfn: ReplvarTypeTable = {}): ReplvarTypeTable {
+        if (isModelOperation(ast)) {
+            this.checkGrammer(ast, isItem ? "i" : "p");
+            return this.getReplVarsType(ast.nodes[0], res, this.getSubAstType(ast, 0, isItem), resfn);
+        }
         if (ast.type === "replvar") {
             res[ast.name] ??= isItem;
             if (res[ast.name] !== isItem) throw TR(`变量`) + ast.name + TR('不能同时为项和公式');
@@ -297,6 +304,7 @@ export class AssertionSystem {
 
     // return ast's type (item for true, boolean for false)
     getAstType(ast: AST, varLists: ReplvarTypeTable): boolean {
+        if (isModelOperation(ast)) return ast.name === "#sat" ? this.getAstType(ast.nodes[0], varLists) : false;
         if (ast.type === "replvar") {
             const v = varLists[ast.name];
             if (v === true) return true;
@@ -306,11 +314,14 @@ export class AssertionSystem {
         if (ast.type === "sym") {
             if (logicSyms.includes(ast.name)) return false;
             if (quantSyms.includes(ast.name)) return false;
+            if (verbSyms.includes(ast.name)) return false;
             if (ast.name === "{|" || ast.name === "|}") return true;
             return true;
         }
         if (ast.type === "fn") {
             if (ast.name === "{" || ast.name === "(") return true;
+            if (this.verbs.has(ast.name)) return false;
+            if (this.fns.has(ast.name)) return true;
             if (ast.name.match(/^#v*nf/) || ast.name.match(/^#c?rp/)) {
                 return this.getAstType(ast.nodes[0], varLists);
             }
@@ -369,6 +380,7 @@ export class AssertionSystem {
         }
     }
     getFreeVars(ast: AST, res: Set<string>, scope: Set<string> = new Set) {
+        if (isModelOperation(ast)) return this.getFreeVars(ast.nodes[0], res, scope);
         const varname = this.getVarName(ast);
         if (varname) {
             if (!scope.has(varname)) res.add(varname);
@@ -397,6 +409,7 @@ export class AssertionSystem {
 
     }
     getVarNamesAndIsNots(ast: AST, res: { [name: string]: Set<string> }, reg: RegExp, scope: Set<string> = new Set): { [name: string]: Set<string> } {
+        if (isModelOperation(ast)) return this.getVarNamesAndIsNots(ast.nodes[0], res, reg, scope);
         const varname = this.getVarName(ast);
         if (varname) {
             if (!varname.match(reg)) return res;
@@ -441,6 +454,7 @@ export class AssertionSystem {
         }
         const eq = this.astEq(ast, subAst);
         if (eq === T) { res.push(scope); return res; } // matched whole ast one time
+        if (isModelOperation(ast)) return false;
         if (eq === U) {
             if (nth === -1 && (this.astEq(ast, dst))) return res;
             return false; // unknown
@@ -518,6 +532,7 @@ export class AssertionSystem {
             res.push(scope);
             return res;
         } // matched whole ast one time
+        if (isModelOperation(ast)) throw new Error("不能在不透明模型操作内部执行普通替换；请先展开模型节点");
         if (eq === U) {
             // if (nth === -1 && this.astEq(ast, newAst)) return res;
             return false; // unknown
@@ -605,6 +620,7 @@ export class AssertionSystem {
     // only according to ast's structure, give its nth child's type
     // this is a helper fn for recursively check sub nodes
     getSubAstType(ast: AST, idx: number, parentType: boolean) {
+        if (isModelOperation(ast)) return idx === 0 ? (ast.name === "#sat" ? parentType : ast.name === "#abst") : true;
         if (ast.type === "meta") return false;
         if (ast.type === "sym") {
             if (ast.name === "{|") return idx <= 1;
@@ -627,6 +643,7 @@ export class AssertionSystem {
     }
     // remove all assert fns without checkments
     unwrapAssertions(ast: AST) {
+        if (isModelOperation(ast)) return;
         if (ast.type === "replvar") return;
         // we don't remove #rp, this can cause #rp in condition can't be matched
         // but that's okay because you never know what is replaced after #rp fn
@@ -641,6 +658,15 @@ export class AssertionSystem {
     }
     // reduce and expand assertions in ast
     expand(ast: AST, isItem: boolean, varLists?: ReplvarTypeTable) {
+        if (ast.type === "fn" && ["#rp", "#crp"].includes(ast.name) && containsModelOperation(ast.nodes?.[0]) &&
+            !astmgr.equal(ast.nodes[0], ast.nodes[1]) && !astmgr.equal(ast.nodes[1], ast.nodes[2])) {
+            throw new Error("普通替换不能穿透不透明模型操作，请先显式展开");
+        }
+        if (isModelOperation(ast)) {
+            this.checkGrammer(ast, isItem ? "i" : "p");
+            this.getReplVarsType(ast, varLists ?? {}, isItem);
+            return;
+        }
         // astmgr.assign(ast,astmgr.clone(ast)); // avoid inner inter refering
         varLists ??= this.getReplVarsType(ast, {}, isItem);
         // first, check all subnodes are consist and expand them
@@ -957,7 +983,7 @@ export class AssertionSystem {
                 return result; // if (nth !== -1), already replaced one, short circuit, if nth === -1, just replace outter layer to avoid loop
             }
         } catch (e) { /** if can't match, just ignore it **/ }
-        if (!ast.nodes?.length) return result;
+        if (isModelOperation(ast) || !ast.nodes?.length) return result;
         for (let i = 0; i < ast.nodes.length; i++) {
             if ("E!V".includes(ast.name) && i === 0) continue; // ignore replacing var name by mistake
             result = this.matchSubAndReplace(ast.nodes[i], pattern, replace, nth, replNameReg, this.getSubAstType(ast, i, isItem), result, varTable);
@@ -973,6 +999,22 @@ export class AssertionSystem {
     checkGrammer(
         ast: AST, type: "m" | "d" | "p" | "v" | "i",
     ) {
+        if (isModelOperation(ast)) {
+            if (type !== "p" && type !== "i") throw new Error("模型操作不能放在变量或规则名称位置");
+            if (ast.nodes?.length !== 2) throw new Error("#sat/#abs 必须恰好有两个参数");
+            if (!this.modelDomainCheck) throw new Error("当前上下文不能核验模型论域");
+            this.modelDomainCheck(ast.nodes[1]);
+            if (ast.name === "#abs") {
+                const body = ast.nodes[0];
+                if (body.type === "sym") ast.name = logicSyms.includes(body.name) || quantSyms.includes(body.name) || verbSyms.includes(body.name) ? "#absf" : "#abst";
+                else if (body.type === "fn" && this.verbs.has(body.name)) ast.name = "#absf";
+                else if ((body.type === "replvar" && this.isConst(body.name)) || (body.type === "fn" && (this.fns.has(body.name) || body.name === "{"))) ast.name = "#abst";
+                else throw new Error("绝对性类别不明确，请使用 #abst(项,D) 或 #absf(公式,D)");
+            }
+            if (ast.name !== "#sat" && type !== "p") throw new Error("#abs 的结果必须是公式");
+            this.checkGrammer(ast.nodes[0], ast.name === "#sat" ? type : ast.name === "#abst" ? "i" : "p");
+            return;
+        }
         if (type === "v") {
             if (!this.getVarName(ast)) throw TR(`表达式出现在了变量的位置中`);
         }
@@ -1024,7 +1066,7 @@ export class AssertionSystem {
                 this.checkGrammer(ast.nodes[2], "i");
                 return;
             } else if (quantSyms.includes(ast.name)) {
-                if (type !== "p") return TR("意外出现了量词") + ast.name;
+                if (type !== "p") throw TR("意外出现了量词") + ast.name;
                 const varName = this.getVarName(ast.nodes[0]);
                 if (!varName) throw TR(`非变量表达式出现在了量词`) + ast.name + TR(`的约束变量中`);
                 if (this.isConst(varName)) {

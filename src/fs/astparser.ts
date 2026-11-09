@@ -52,7 +52,7 @@ export class ASTParser {
                 return `(${this.stringify(nd[0])} ${ast.name} ${this.stringify(nd[1])})`;
         }
     }
-    parse(s: string) {
+    parse(s: string, strict = false) {
         this.cursor = 0;
         this.tokenise(s.replaceAll("∀", "V").replaceAll("∃", "E").replaceAll("∈", "@").replaceAll("¬", "~")
             .replaceAll("→", ">").replaceAll("↔", "<>").replaceAll("⊂", "<").replaceAll("∪", "U").replaceAll("∩", "I")
@@ -60,7 +60,10 @@ export class ASTParser {
             .replaceAll("ℕ", "N").replaceAll("ℤ", "Z").replaceAll("ℚ", "Q").replaceAll("ℝ", "R").replaceAll("×","*")
         );
         this.nextSym();
-        return this.meta();
+        const ast = this.meta();
+        // Model expressions must never silently accept a parsed prefix.
+        if ((strict || /#(?:sat|abs|abst|absf)\s*\(/.test(s)) && this.token !== undefined) throw new Error("表达式末尾有未解析内容：" + this.token);
+        return ast;
     }
     private tokenise(s: string) {
         for (let i = 0; i < this.keywords.length; i++) {

@@ -4,6 +4,7 @@ import { ASTParser } from "./astparser.js";
 import { Deduction } from "./formalsystem.js";
 import { FSGui } from "./gui.js";
 import { SavesParser } from "./savesparser.js";
+import { isModelOperation, ModelKind } from "./model.js";
 
 export class FSCmd {
     cmdBuffer: any[] = [];
@@ -201,6 +202,7 @@ export class FSCmd {
 
     }
     clearCmdBuffer() {
+        document.querySelectorAll(".model-selectable").forEach(e => e.classList.remove("model-selectable"));
         if (this.pListMasked) { this.gui.clearPListMasked(); this.pListMasked = false; }
         if (this.escClear) {
             this.cmdBuffer = [];
@@ -223,7 +225,16 @@ export class FSCmd {
             e.disabled = true;
         });
         try {
+            if (typeof cmdBuffer[0] === "string" && /^(unfold|sat-expand|abs-expand|sat-def)\s/.test(cmdBuffer[0])) {
+                const input = cmdBuffer.shift() as string;
+                const match = input.match(/^(\S+)\s+(\S+)(?:\s+([\s\S]+))?$/);
+                cmdBuffer.unshift(match[1], match[2]);
+                if (match[3]) cmdBuffer.push(match[3]);
+            }
             switch (cmdBuffer[0]) {
+                case "unfold": case "sat-expand": case "abs-expand": return this.execModelExpand();
+                case "sat-def": return this.execSatDefinition();
+                case "mfinduct": return this.execModelInduction();
                 case "copy": {
                     hintText.innerText = TR("可复制定理内容，按Esc取消");
                     if (cmdBuffer.length > 1) {
@@ -283,6 +294,59 @@ export class FSCmd {
             this.clearCmdBuffer();
             hintText.innerText = TR(`意外的错误：`) + e;
         }
+    }
+    private modelKind(): ModelKind {
+        return this.cmdBuffer[0] === "sat-expand" ? "sat" : this.cmdBuffer[0] === "abs-expand" ? "abs" : "all";
+    }
+    private modelProposition(text: string): number {
+        if (!/^p?[0-9]+$/.test(String(text))) throw new Error("请输入 p0 形式的定理编号");
+        const index = Number(String(text).replace(/^p/, ""));
+        if (!this.gui.formalSystem.propositions[index]) throw new Error("此定理不存在");
+        return index;
+    }
+    private execModelExpand() {
+        const b = this.cmdBuffer;
+        if (b.length === 1) { this.gui.hintText.innerText = "请选择要展开的定理，或输入 p0 形式的编号"; return; }
+        const source = this.modelProposition(b[1]);
+        if (b.length === 2) {
+            const nodes = this.gui.formalSystem.model.nodes(this.gui.formalSystem.propositions[source].value, this.modelKind());
+            if (!nodes.length) throw new Error("此定理没有可选的模型节点");
+            this.gui.hintText.innerText = `点击要展开的模型括号/上标，或输入节点序号（1–${nodes.length}）；Esc 取消`;
+            this.gui.updatePropositionList(true);
+            return;
+        }
+        if (b.length !== 3 || !/^[1-9][0-9]*$/.test(b[2])) throw new Error("节点序号必须是从 1 开始的整数");
+        const result = this.gui.formalSystem.unfoldModel(source, Number(b[2]), this.modelKind());
+        this.clearCmdBuffer(); this.gui.updatePropositionList(true);
+        this.gui.hintText.innerText = `已生成 p${result}，源定理保留`;
+    }
+    private execSatDefinition() {
+        const b = this.cmdBuffer;
+        if (b.length === 1) { this.gui.hintText.innerText = "请选择 df/dv/dc 定义规则，或输入其名称"; return; }
+        this.gui.formalSystem.model.inspectDefinition(b[1]);
+        if (b.length === 2) { this.gui.hintText.innerText = "请输入已由 mprd 定义的一元论域谓词名（本阶段不接受固定参数域）"; return; }
+        if (b.length !== 3) throw new Error("sat-def 参数数量错误");
+        const rule = this.gui.formalSystem.model.define(b[1], this.astparser.parse(b[2], true));
+        if (!this.gui.deductions.includes(rule)) this.gui.addToDeductions(rule);
+        this.clearCmdBuffer(); this.gui.updateDeductionList();
+        this.gui.hintText.innerText = `已生成或复用内部定义 ${rule}；存在前提完整保留`;
+    }
+    private execModelInduction() {
+        const b = this.cmdBuffer;
+        const prompts = ["", "请输入性质公式模板，用 #slot 表示公式槽", "请输入要递归证明的具体公式（变量原子、~、>、V）",
+            "请选择属于原子分支的规则", "请选择相等原子分支的规则", "请选择否定构造分支的规则",
+            "请选择蕴含构造分支的规则", "请选择全称构造分支的规则", "请输入共同前提定理编号，以逗号分隔；无前提输入 -"];
+        if (b.length < 9) { this.gui.hintText.innerText = prompts[b.length]; return; }
+        if (b.length !== 9) throw new Error("结构递归参数数量错误");
+        const common = b[8].trim() === "-" ? [] : b[8].split(",").map(x => this.modelProposition(x.trim()));
+        const result = this.gui.formalSystem.model.induct(this.astparser.parse(b[1], true), this.astparser.parse(b[2], true), b.slice(3, 8), common);
+        this.clearCmdBuffer(); this.gui.updatePropositionList(true);
+        this.gui.hintText.innerText = `已逐分支组合出 p${result}；这是具体公式的证明，不代表已证明任意公式模式`;
+    }
+    startSatDefinition(name: string) {
+        if (this.cmdBuffer.length === 1 && this.cmdBuffer[0] === "sat-def") { this.cmdBuffer.push(name); this.execCmdBuffer(); return; }
+        if (this.cmdBuffer.length) { this.gui.hintText.innerText = "请先完成当前行动，或按 Esc 取消"; return; }
+        this.cmdBuffer.push("sat-def", name); this.execCmdBuffer();
     }
     execExpand() {
         const hintText = this.gui.hintText;
@@ -905,9 +969,31 @@ export class FSCmd {
         }
         hintText.innerText = TR(`请输入假设命题p`) + (hypCount === -1 ? formalSystem.propositions.length : hypCount) + TR(`，或按“Esc”结束`);
     }
-    onClickSubAst(idx: string, inserted: string) {
+    onClickSubAst(idx: string, inserted: string, selectedAst?: AST) {
         if (idx === "-") return;
         const cmdBuffer = this.cmdBuffer;
+        if (["unfold", "sat-expand", "abs-expand"].includes(cmdBuffer[0])) {
+            if (cmdBuffer.length === 1) {
+                if (!/^p[0-9]+$/.test(idx)) { this.gui.hintText.innerText = "请选择源定理"; return; }
+                cmdBuffer.push(idx); this.execCmdBuffer(); return;
+            }
+            const source = this.modelProposition(cmdBuffer[1]);
+            if (idx !== "p" + source || !selectedAst || !isModelOperation(selectedAst)) { this.gui.hintText.innerText = "请点击已选定理中要展开的模型括号或上标"; return; }
+            const nodes = this.gui.formalSystem.model.nodes(this.gui.formalSystem.propositions[source].value, this.modelKind());
+            const nth = nodes.findIndex(n => n.node === selectedAst);
+            if (nth < 0) { this.gui.hintText.innerText = "该节点不属于当前筛选类型"; return; }
+            cmdBuffer.push(String(nth + 1)); this.execCmdBuffer(); return;
+        }
+        if (cmdBuffer[0] === "sat-def") {
+            if (cmdBuffer.length === 1 && this.gui.formalSystem.deductions[idx]) { cmdBuffer.push(idx); this.execCmdBuffer(); }
+            else this.replaceActionInputFromClick(inserted);
+            return;
+        }
+        if (cmdBuffer[0] === "mfinduct") {
+            if (cmdBuffer.length >= 3 && cmdBuffer.length <= 7 && this.gui.formalSystem.deductions[idx]) { cmdBuffer.push(idx); this.execCmdBuffer(); }
+            else this.replaceActionInputFromClick(inserted);
+            return;
+        }
         // click prop just for copy
         if (idx.startsWith("p") && !cmdBuffer.length || cmdBuffer[0] === "copy") {
             cmdBuffer.push("copy");

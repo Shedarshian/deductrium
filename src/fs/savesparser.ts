@@ -4,7 +4,8 @@ import { Deduction, DeductionStep, FormalSystem, Proposition } from "./formalsys
 import { FSGui } from "./gui.js";
 import { initFormalSystem } from "./initial.js";
 import { RuleParser } from "./metarule.js";
-type SerilizedDeductionStep = [string, number[], string[]];
+import { ASTMgr } from "./astmgr.js";
+type SerilizedDeductionStep = [string, number[], string[], { path: number[]; target: string }?];
 type SerilizedDeduction = [string, string, SerilizedDeductionStep[]] | [string, string, SerilizedDeductionStep[], string[]];
 type SerilizedProposition = [string, SerilizedDeductionStep];
 
@@ -17,10 +18,12 @@ export class SavesParser {
         this.bug260616fixer.fixbug260616 = true;
     }
     serializeDeductionStep(s: DeductionStep) {
-        return [
+        const step: SerilizedDeductionStep = [
             s.deductionIdx, s.conditionIdxs,
             s.replaceValues.map(v => astparser.stringifyTight(v))
-        ] as SerilizedDeductionStep;
+        ];
+        if (s.model) step.push({ path: s.model.path.slice(), target: astparser.stringifyTight(s.model.target) });
+        return step;
     }
     serializeProposition(p: Proposition): SerilizedProposition {
         const value = astparser.stringifyTight(p.value);
@@ -28,7 +31,8 @@ export class SavesParser {
         return [value, step];
     }
     deserializeDeductionStep(v: SerilizedDeductionStep): DeductionStep {
-        return { conditionIdxs: v[1], deductionIdx: v[0], replaceValues: v[2].map(v => astparser.parse(v)) };
+        return { conditionIdxs: v[1], deductionIdx: v[0], replaceValues: v[2].map(v => astparser.parse(v)),
+            model: v[3] ? { path: v[3].path.slice(), target: astparser.parse(v[3].target) } : undefined };
     }
     deserializeProposition(v: SerilizedProposition): Proposition {
         return {
@@ -75,9 +79,9 @@ export class SavesParser {
         const val = astparser.parse(sd[0]);
         try{ this.assert.expand(val, false); }catch(e){}
 
-        fs.addDeduction(name, val, sd[1], sd[2]?.map(e => ({
-            deductionIdx: e[0].includes(">.a1_") ? this.fixbug260330(e[0]) : e[0].includes(":") ? this.fixbug260616(e[0]) : e[0], conditionIdxs: e[1], replaceValues: e[2].map(v => astparser.parse(v))
-        })), sd[3] ? new Set(sd[3]) : new Set());
+        fs.addDeduction(name, val, sd[1], sd[2]?.map(e => this.deserializeDeductionStep([
+            e[0].includes(">.a1_") ? this.fixbug260330(e[0]) : e[0].includes(":") ? this.fixbug260616(e[0]) : e[0], e[1], e[2], e[3]
+        ])), sd[3] ? new Set(sd[3]) : new Set());
     }
     serialize(gui: FSGui) {
         const fs = gui.formalSystem;
@@ -112,9 +116,19 @@ export class SavesParser {
         for (const [k, v] of Object.entries(dictD)) {
             if ((v as any[]).length) this.deserializeDeduction(k, fs, v as SerilizedDeduction);
         }
+        const replay = arrP?.some(v => /#(?:sat|abs|abst|absf)\(/.test(v[0]) || !!v[1]?.[3]) ||
+            Object.values(fs.deductions).some(d => fs.hasModelProof(d) || d.from.startsWith("模型解释:"));
         if (arrP)
             for (const v of arrP) {
-                fs.propositions.push(this.deserializeProposition(v));
+                const p = this.deserializeProposition(v);
+                if (p.from && replay) {
+                    fs.assert.checkGrammer(p.value, "p");
+                    const index = fs.deduct(p.from);
+                    if (!new ASTMgr().equal(fs.propositions[index].value, p.value)) throw new Error("存档中的模型推理结论未通过重放核验");
+                } else {
+                    fs.assert.checkGrammer(p.value, "p");
+                    fs.propositions.push(p);
+                }
             }
         return { fs, arrD, arrM };
     }
@@ -126,6 +140,7 @@ export class SavesParser {
         const skipRendering = gui.skipRendering;
         gui.skipRendering = true;
         const fsArrD = initFormalSystem(this.creative);
+        fsArrD.fs.fastmetarules = gui.formalSystem.fastmetarules;
         const fsdata = this.deserializeArr(fsArrD.fs, JSON.parse(str));
         const savedMetarules = gui.formalSystem.fastmetarules;
         gui.formalSystem = fsdata.fs;

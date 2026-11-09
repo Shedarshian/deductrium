@@ -4,8 +4,8 @@ import { Proof } from "./proof.js";
 import { ASTParser } from "./astparser.js";
 import { TR } from "../lang.js";
 import { ConstrainSolver, RuleParser } from "./metarule.js";
+import { containsModelOperation, ModelOperations } from "./model.js";
 const astmgr = new ASTMgr;
-const assert = new AssertionSystem;
 const parser = new ASTParser;
 const ruleparser = new RuleParser();
 export class FormalSystem {
@@ -24,27 +24,63 @@ export class FormalSystem {
     fns = new Set();
     verbs = new Set();
     propositions = [];
-    assert = assert;
+    assert = new AssertionSystem();
+    model = new ModelOperations(this);
+    activeModelProofs = new Set();
     constructor() {
         this.assert.fns = this.fns;
         this.assert.verbs = this.verbs;
         this.assert.consts = this.consts;
+        this.assert.modelDomainCheck = domain => this.model.checkDomain(domain);
+        // A safe identity descriptor for display and legacy bookkeeping. Actual
+        // model steps are accepted only by deduct's separately checked branch.
+        this.addDeduction(".modelunfold", parser.parse("$0⊢$0"), "模型定义展开");
+    }
+    hasModelProof(d, seen = new Set()) {
+        if (!d || seen.has(d))
+            return false;
+        seen.add(d);
+        return !!d.steps?.some(s => !!s.model || s.deductionIdx === ".modelunfold" || this.hasModelProof(this.deductions[s.deductionIdx], seen));
+    }
+    assertLegacyMetaInput(name) {
+        if (this.hasModelProof(this.generateDeduction(name)))
+            throw new Error("此元规则尚不能转换含模型展开步骤的宏；请直接应用该宏并重放核验");
+    }
+    protectModelDefinitions(exclude) {
+        if (Object.entries(this.deductions).some(([name, d]) => name !== exclude &&
+            (containsModelOperation(d.value) || d.from.startsWith("模型解释:") || this.hasModelProof(d))) ||
+            this.propositions.some(p => containsModelOperation(p.value))) {
+            throw new Error("模型表达式或内部解释仍在使用定义，不能删除或重命名定义符号");
+        }
+    }
+    unfoldModel(proposition, nth, kind) {
+        const source = this.propositions[proposition];
+        if (!source || !Number.isInteger(proposition) || !Number.isSafeInteger(nth) || nth < 1)
+            throw new Error("请选择存在的定理和从 1 开始的节点序号");
+        const target = this.model.nodes(source.value, kind)[nth - 1];
+        if (!target)
+            throw new Error("指定序号的模型节点不存在");
+        // Check availability now; replay verifies the same mathematical rule
+        // even when a UI syntax option is later switched off.
+        this.model.unfold(source.value, target.path, target.node);
+        return this.deduct({ deductionIdx: ".modelunfold", conditionIdxs: [proposition], replaceValues: [],
+            model: { path: target.path.slice(), target: astmgr.clone(target.node) } });
     }
     ast2deduction(ast) {
-        assert.checkGrammer(ast, "d");
+        this.assert.checkGrammer(ast, "d");
         const [conditions, conclusions] = ast.nodes;
         const varLists = {};
         const allReplvars = new Set;
         const matchingReplvars = new Set;
         conditions.nodes.map(c => {
-            assert.getReplVarsType(c, varLists, false);
+            this.assert.getReplVarsType(c, varLists, false);
             astmgr.getVarNames(c, allReplvars, /^\$/);
             const netC = astmgr.clone(c);
-            assert.unwrapAssertions(netC);
+            this.assert.unwrapAssertions(netC);
             astmgr.getVarNames(netC, matchingReplvars, /^\$/);
             return netC;
         });
-        assert.getReplVarsType(conclusions.nodes[0], varLists, false);
+        this.assert.getReplVarsType(conclusions.nodes[0], varLists, false);
         astmgr.getVarNames(conclusions, allReplvars, /^\$/);
         return {
             value: ast,
@@ -79,6 +115,8 @@ export class FormalSystem {
         return name === deductionIdx || res.includes(name);
     }
     removeDeduction(name) {
+        if (/^d[cfv]/.test(name))
+            this.protectModelDefinitions(name);
         if (!this.deductions[name])
             throw TR("规则名称 ") + name + TR(" 不存在");
         if (this.getDeductionTokens(name).length > 1)
@@ -121,6 +159,8 @@ export class FormalSystem {
         return true;
     }
     renameDeduction(oldname, newname) {
+        if (/^d[cfv]/.test(oldname))
+            this.protectModelDefinitions(oldname);
         if (this.getDeductionTokens(oldname).length > 1 || this.getDeductionTokens(newname).length > 1)
             throw TR("无法重命名快速元规则");
         if (oldname.match(/^[mad\.]/)) {
@@ -228,16 +268,16 @@ export class FormalSystem {
     addHypothese(m, expandMode) {
         m = astmgr.clone(m);
         const astAssertions = {};
-        assert.match(m, null, /^\$/, false, null, null, astAssertions, []);
+        this.assert.match(m, null, /^\$/, false, null, null, astAssertions, []);
         // assertions in condition can spread, i.e. fn(a,nf(a))  => fn(nf(a),nf(a))
         for (const astAss of Object.values(astAssertions)) {
             astmgr.replace(m, astAss.nodes[0], astAss);
         }
-        assert.checkGrammer(m, "p");
+        this.assert.checkGrammer(m, "p");
         if (!expandMode && this._hasLocalNames(m))
             throw TR("假设中不能出现以#号开头的局部变量");
         try {
-            assert.expand(m, false);
+            this.assert.expand(m, false);
         }
         catch (e) {
             throw TR("假设中") + e;
@@ -354,7 +394,8 @@ export class FormalSystem {
                     // this.replaceTempVar(newv, subTempvars);
                     return newv;
                 }),
-                deductionIdx: step.deductionIdx
+                deductionIdx: step.deductionIdx,
+                model: step.model ? { path: step.model.path.slice(), target: astmgr.clone(step.model.target) } : undefined
             });
         }
         return this.addDeduction(name, {
@@ -438,13 +479,13 @@ export class FormalSystem {
             this.propositions.splice(dst, 0, moved);
     }
     isNameCanBeNewConst(name) {
-        if (assert.isConst(name))
+        if (this.assert.isConst(name))
             return `"${name}" ` + TR(`已有定义，无法重复定义`);
         this.consts.add(name);
         for (const [idx, d] of Object.entries(this.deductions)) {
             try {
-                assert.checkGrammer(d.value, "d");
-                assert.getReplVarsType(d.conclusion, {}, false);
+                this.assert.checkGrammer(d.value, "d");
+                this.assert.getReplVarsType(d.conclusion, {}, false);
             }
             catch (e) {
                 this.consts.delete(name);
@@ -453,8 +494,8 @@ export class FormalSystem {
         }
         for (const [idx, p] of this.propositions.entries()) {
             try {
-                assert.checkGrammer(p.value, "p");
-                assert.getReplVarsType(p.value, {}, false);
+                this.assert.checkGrammer(p.value, "p");
+                this.assert.getReplVarsType(p.value, {}, false);
             }
             catch (e) {
                 this.consts.delete(name);
@@ -467,8 +508,8 @@ export class FormalSystem {
     isNameCanBeNewFnOrVerb() {
         for (const [idx, d] of Object.entries(this.deductions)) {
             try {
-                assert.checkGrammer(d.value, "d");
-                assert.getReplVarsType(d.conclusion, {}, false);
+                this.assert.checkGrammer(d.value, "d");
+                this.assert.getReplVarsType(d.conclusion, {}, false);
             }
             catch (e) {
                 throw TR(`定义符号失败：`) + ` ${idx} : ` + e;
@@ -476,8 +517,8 @@ export class FormalSystem {
         }
         for (const [idx, p] of this.propositions.entries()) {
             try {
-                assert.checkGrammer(p.value, "p");
-                assert.getReplVarsType(p.value, {}, false);
+                this.assert.checkGrammer(p.value, "p");
+                this.assert.getReplVarsType(p.value, {}, false);
             }
             catch (e) {
                 throw TR(`定义符号失败：`) + ` p${idx} : ` + e;
@@ -504,6 +545,8 @@ export class FormalSystem {
                 throw "null";
             const subRuleName = ruleparser.stringify(tree[1]);
             this.generateDeductionByToken(tree[1], subRuleName);
+            if (this.hasModelProof(this.deductions[subRuleName]))
+                throw new Error("含模型展开步骤的宏暂不能转换为快速元规则；请直接应用并重新核验");
             return this.deductions[fn.bind(this)(subRuleName, from)];
         }
         if (tree[0] === ":") {
@@ -514,6 +557,8 @@ export class FormalSystem {
                 tempvar !== "#" ? this.generateDeductionByToken(t, tempvar) : null,
                 tempvar));
             const d2name = d1names.pop();
+            if ([...d1names, d2name].some(n => this.hasModelProof(this.deductions[n])))
+                throw new Error("含模型展开步骤的宏暂不能使用组合元规则");
             return this.deductions[this.metaCombineTheorem(d1names, d2name, from)];
         }
         if (tree.length === 1) {
@@ -791,6 +836,36 @@ export class FormalSystem {
         return this.addDeduction(name, parser.parse(`⊢${num}r = {x@Q|x<=${num}&~x=${num}}`), "算数符号定义");
     }
     deduct(step, inlineMode, partialTest) {
+        const before = this.propositions.slice();
+        const guarded = !partialTest && (this.activeModelProofs.size > 0 || this.hasModelProof(this.deductions[step.deductionIdx]));
+        if (guarded && (this.activeModelProofs.has(step.deductionIdx) || this.activeModelProofs.size >= 128))
+            throw new Error("模型证明存在循环依赖或重放深度超限");
+        if (guarded)
+            this.activeModelProofs.add(step.deductionIdx);
+        try {
+            return this.deductChecked(step, inlineMode, partialTest);
+        }
+        catch (e) {
+            this.propositions = before;
+            throw e;
+        }
+        finally {
+            if (guarded)
+                this.activeModelProofs.delete(step.deductionIdx);
+        }
+    }
+    deductChecked(step, inlineMode, partialTest) {
+        if (step.model) {
+            if (step.deductionIdx !== ".modelunfold" || step.conditionIdxs.length !== 1 || step.replaceValues.length)
+                throw new Error("模型展开步骤格式错误");
+            const index = step.conditionIdxs[0];
+            if (!Number.isInteger(index) || index < 0 || !this.propositions[index])
+                throw new Error("模型展开引用了无效定理");
+            const value = this.model.unfold(this.propositions[index].value, step.model.path, step.model.target, true);
+            if (partialTest)
+                return;
+            return this.propositions.push({ value, from: { ...step, model: { path: step.model.path.slice(), target: astmgr.clone(step.model.target) } } }) - 1;
+        }
         const { conditionIdxs, deductionIdx, replaceValues } = step;
         const deduction = this.generateDeduction(deductionIdx);
         const errorMsg = TR(`规则 `) + deductionIdx + TR(` 推理失败:`);
@@ -799,7 +874,7 @@ export class FormalSystem {
         const { conditions, conclusion, replaceNames, steps, replaceTypes } = deduction;
         // firstly, match condition, get matchtable ( partial initially provided by users)
         let replacedVarTypeTable = {};
-        let matchTable = partialTest ? {} : Object.fromEntries(replaceNames.map((replname, idx) => (assert.getReplVarsType(replaceValues[idx], replacedVarTypeTable, replaceTypes[replname]),
+        let matchTable = partialTest ? {} : Object.fromEntries(replaceNames.map((replname, idx) => (this.assert.getReplVarsType(replaceValues[idx], replacedVarTypeTable, replaceTypes[replname]),
             [replname, astmgr.clone(replaceValues[idx])])));
         // assertions in pattern
         let assertions = [];
@@ -815,7 +890,7 @@ export class FormalSystem {
                 throw errorMsg + TR(`第${conditionIdx + 1}个`) + TR(`条件对应的定理p`) + condPropIdx + TR(`不存在`);
             try {
                 // 
-                assert.match(condProp.value, condition, /^\$/, false, matchTable, replacedVarTypeTable, null, assertions);
+                this.assert.match(condProp.value, condition, /^\$/, false, matchTable, replacedVarTypeTable, null, assertions);
                 while (assertionsFrom.length < assertions.length)
                     assertionsFrom.push(conditionIdx);
             }
@@ -826,8 +901,8 @@ export class FormalSystem {
         }
         replaceNames.forEach((replname, idx) => {
             const nast = astmgr.clone(replaceValues[idx]);
-            assert.expand(nast, replaceTypes[replname]);
-            assert.match(nast, null, /^\$/, replaceTypes[replname], null, null, astAssertions, assertions);
+            this.assert.expand(nast, replaceTypes[replname]);
+            this.assert.match(nast, null, /^\$/, replaceTypes[replname], null, null, astAssertions, assertions);
         });
         if (partialTest)
             return; // just test, no props to add
@@ -847,7 +922,7 @@ export class FormalSystem {
             astmgr.replaceByMatchTable(cas, matchTable);
             // todo: how to get assert's type
             try {
-                assert.assertUnwrap(cas, replacedVarTypeTable);
+                this.assert.assertUnwrap(cas, replacedVarTypeTable);
             }
             catch (e) {
                 // assertion in condition failed (first layer must be T)
@@ -859,14 +934,14 @@ export class FormalSystem {
         // to prevent #nf inconsist in conclusion, we record replaceVals
         astmgr.replaceByMatchTable(replacedConclusion, matchTable);
         try {
-            assert.checkGrammer(replacedConclusion, "p");
+            this.assert.checkGrammer(replacedConclusion, "p");
             // grammar in conclusion failed
         }
         catch (e) {
             throw TR("结论中出现语法错误：") + e;
         }
         try {
-            assert.expand(replacedConclusion, false);
+            this.assert.expand(replacedConclusion, false);
         }
         catch (e) {
             // assertion in conclusion failed (can be T or U, only F to fail)
@@ -876,6 +951,9 @@ export class FormalSystem {
         let netInlineMode = inlineMode;
         if (typeof netInlineMode === "function")
             netInlineMode = netInlineMode(step, replacedConclusion);
+        const guardedModelProof = this.hasModelProof(deduction);
+        if (guardedModelProof)
+            netInlineMode = "deep";
         if (!steps?.length || !netInlineMode) {
             return this.propositions.push({ value: replacedConclusion, from: step }) - 1;
         }
@@ -907,7 +985,14 @@ export class FormalSystem {
             let firstPos = this.propositions.length - 1;
             let lastPos;
             try {
-                lastPos = this.deduct({ deductionIdx: substep.deductionIdx, replaceValues, conditionIdxs: replacedConditionIdxs }, netInlineMode === "deep" ? inlineMode : null);
+                let model;
+                if (substep.model) {
+                    const target = astmgr.clone(substep.model.target);
+                    this.replaceTempVar(target, tempvars);
+                    astmgr.replaceByMatchTable(target, matchTable);
+                    model = { path: substep.model.path.slice(), target };
+                }
+                lastPos = this.deduct({ deductionIdx: substep.deductionIdx, replaceValues, conditionIdxs: replacedConditionIdxs, model }, netInlineMode === "deep" ? (guardedModelProof ? "deep" : inlineMode) : null);
             }
             catch (e) {
                 // if one substep is wrong, remove newly added substeps from proplist
@@ -920,6 +1005,12 @@ export class FormalSystem {
             propsOffset.unshift(lastPos - firstPos - 1);
         }
         const propLength = this.propositions.length;
+        if (guardedModelProof && !astmgr.equal(this.propositions[propLength - 1]?.value, replacedConclusion))
+            throw new Error("模型宏实例化后的实际证明与声明结论不一致");
+        if (guardedModelProof && !inlineMode) {
+            this.propositions.splice(startPropositions);
+            return this.propositions.push({ value: replacedConclusion, from: step }) - 1;
+        }
         return propLength - 1;
     }
     expandMacroWithProp(propositionIdx) {
@@ -1010,6 +1101,7 @@ export class FormalSystem {
         return { type: "replvar", name };
     }
     metaQuantifyAxiomSchema(deductionIdx, from) {
+        this.assertLegacyMetaInput(deductionIdx);
         const d = this.generateDeduction(deductionIdx);
         if (!d)
             throw TR(`推理规则 `) + deductionIdx + TR(` 不存在`);
@@ -1037,6 +1129,7 @@ export class FormalSystem {
         }, from);
     }
     metaExistTheorem(idx, from) {
+        this.assertLegacyMetaInput(idx);
         const d = this.generateDeduction(idx);
         if (d.conditions.length !== 1)
             throw TR("匹配条件推理规则($$0 ⊢ $$1)失败");
@@ -1077,6 +1170,7 @@ export class FormalSystem {
         }
     }
     metaConditionUniversalTheorem(idx, from) {
+        this.assertLegacyMetaInput(idx);
         // mp
         if (this.deductions["v" + idx])
             return "v" + idx;
@@ -1144,6 +1238,7 @@ export class FormalSystem {
         }
     }
     metaUniversalTheorem(idx, from) {
+        this.assertLegacyMetaInput(idx);
         if (this.deductions["u" + idx])
             return "u" + idx;
         const d = this.generateDeduction(idx);
@@ -1156,7 +1251,7 @@ export class FormalSystem {
         }
         const s = this._findNewReplName(idx);
         for (const [idx, cond] of d.conditions.entries()) {
-            if (assert.nf(s.name, cond) === -1) {
+            if (this.assert.nf(s.name, cond) === -1) {
                 throw TR(`元推理结论规则中的条件中的#nf函数永远无法通过验证`);
             }
         }
@@ -1207,7 +1302,7 @@ export class FormalSystem {
                 const newHyp = { type: "fn", name: "#nf", nodes: [c, s] };
                 this.addHypothese(newHyp);
                 try {
-                    assert.match(this.propositions[id].value, c, /^\$/, false, replvarTable, {}, null, []);
+                    this.assert.match(this.propositions[id].value, c, /^\$/, false, replvarTable, {}, null, []);
                 }
                 catch (e) {
                     throw TR(`向`) + TR(`第${id + 1}个`) + TR(`条件添加不自由断言时出现不一致：`) + e;
@@ -1233,6 +1328,8 @@ export class FormalSystem {
     }
     metaNewConstant(replaceValues, from) {
         const [constAst, varAst, exprAst] = replaceValues;
+        if (containsModelOperation(exprAst))
+            throw new Error("选择定义前须先展开模型操作，避免对选取值再次内部解释");
         if (constAst.type !== "replvar")
             throw TR("$$0只能为纯变量名");
         if (constAst.name.match(/[A-Z]/))
@@ -1253,16 +1350,16 @@ export class FormalSystem {
             "$$2": exprAst
         };
         astmgr.replaceByMatchTable(deduction, replTable);
-        if (assert.nf(constAst.name, exprAst) !== 1)
+        if (this.assert.nf(constAst.name, exprAst) !== 1)
             throw TR("检测到可能的循环定义");
         const R = astmgr.clone(exprAst);
         astmgr.replace(R, varAst, constAst);
         const freeVars = new Set;
-        assert.getFreeVars(exprAst, freeVars);
-        if (Array.from(freeVars).find(e => e !== varAst.name && !assert.isConst(e))) {
+        this.assert.getFreeVars(exprAst, freeVars);
+        if (Array.from(freeVars).find(e => e !== varAst.name && !this.assert.isConst(e))) {
             throw TR("表达式不能有自由变量");
         }
-        if (assert.nf(constAst.name, R) !== -1)
+        if (this.assert.nf(constAst.name, R) !== -1)
             throw TR("定义的常量没在结论中出现");
         astmgr.assign(deduction.nodes[1].nodes[0].nodes[1], R);
         let d;
@@ -1282,6 +1379,8 @@ export class FormalSystem {
     }
     metaNewFunction(replaceValues, from) {
         const [fnAst, varAst, exprAst, paramAsts] = replaceValues;
+        if (containsModelOperation(exprAst))
+            throw new Error("选择定义前须先展开模型操作，避免对选取值再次内部解释");
         if (!paramAsts.length)
             throw null;
         if (fnAst.type !== "replvar")
@@ -1314,8 +1413,8 @@ export class FormalSystem {
             throw TR("检测到可能的循环定义");
         const wrapVs = (ast) => {
             const freeVars = new Set;
-            assert.getFreeVars(exprAst, freeVars);
-            if (Array.from(freeVars).find(e => e !== varAst.name && !paramAsts.find(p => p.name === e) && !assert.isConst(e))) {
+            this.assert.getFreeVars(exprAst, freeVars);
+            if (Array.from(freeVars).find(e => e !== varAst.name && !paramAsts.find(p => p.name === e) && !this.assert.isConst(e))) {
                 throw TR("表达式不能有自由变量");
             }
             console.assert(ast.name === "V");
@@ -1324,7 +1423,7 @@ export class FormalSystem {
                 const n = p.name;
                 if (p.type !== "replvar")
                     throw TR("函数的参数必须是变量");
-                if (assert.isConst(n))
+                if (this.assert.isConst(n))
                     throw TR("函数的参数不能是常量");
                 if (first) {
                     astmgr.assign(ast.nodes[0], p);
@@ -1336,7 +1435,7 @@ export class FormalSystem {
         };
         astmgr.replaceByMatchTable(deduction, replTable);
         const R = astmgr.clone(exprAst);
-        if (assert.nf(varAst.name, R) !== -1)
+        if (this.assert.nf(varAst.name, R) !== -1)
             throw TR("定义的函数表达式没在结论中出现");
         astmgr.replace(R, varAst, { type: "fn", name: fnAst.name, nodes: paramAsts });
         astmgr.assign(deduction.nodes[1].nodes[0].nodes[1].nodes[1], R);
@@ -1396,7 +1495,7 @@ export class FormalSystem {
                 const n = p.name;
                 if (p.type !== "replvar")
                     throw TR("函数的参数必须是变量");
-                if (assert.isConst(n))
+                if (this.assert.isConst(n))
                     throw TR("函数的参数不能是常量");
                 if (first) {
                     astmgr.assign(ast.nodes[0], p);
@@ -1437,6 +1536,7 @@ export class FormalSystem {
         }
     }
     metaConditionTheorem(idx, from) {
+        this.assertLegacyMetaInput(idx);
         // mp
         if (this.deductions["c" + idx])
             return "c" + idx;
@@ -1519,6 +1619,7 @@ export class FormalSystem {
         }
     }
     metaDeductTheorem(idx, from) {
+        this.assertLegacyMetaInput(idx);
         if (idx[0] === "<") {
             this.generateDeduction(idx.slice(1));
             return idx.slice(1);
@@ -1614,6 +1715,7 @@ export class FormalSystem {
         }
     }
     metaInvDeductTheorem(idx, from) {
+        this.assertLegacyMetaInput(idx);
         // >a => a
         if (idx[0] === ">") {
             this.generateDeduction(idx.slice(1));
@@ -1647,6 +1749,8 @@ export class FormalSystem {
         }
     }
     metaCompleteTheorem(ast, name, from) {
+        if (containsModelOperation(ast))
+            throw new Error("命题逻辑自动证明暂不接受模型操作，请先显式展开");
         const proof = new Proof(this);
         const p = this.propositions;
         try {
@@ -1662,6 +1766,7 @@ export class FormalSystem {
         return name;
     }
     metaCombineTheorem(idx1s, idx2, from) {
+        [...idx1s.filter(n => n !== "#"), idx2].forEach(n => this.assertLegacyMetaInput(n));
         const name = ":" + idx1s.join(":") + "," + idx2;
         if (this.deductions[name])
             return name;
@@ -1780,6 +1885,7 @@ export class FormalSystem {
         }
     }
     metaIffTheorem(idx, replaceValues, name, from, allowIFFT_RP) {
+        this.assertLegacyMetaInput(idx);
         const d = this.generateDeduction(idx);
         if (!d)
             throw TR("推理规则不存在");
@@ -1798,7 +1904,7 @@ export class FormalSystem {
         nth -= 1;
         const oldP = this.propositions;
         const R = astmgr.clone(C);
-        assert.matchSubAndReplace(R, A, B, nth, /^\$/, false, 0, assert.getReplVarsType(R, {}, false));
+        this.assert.matchSubAndReplace(R, A, B, nth, /^\$/, false, 0, this.assert.getReplVarsType(R, {}, false));
         let A_B;
         let replacedNth = 0;
         // generate a <> b or VxVyVz a<>b
@@ -1808,7 +1914,7 @@ export class FormalSystem {
                 // example: (~~a>~~b) <> (~~a > b), also count ~~a one time
                 try {
                     const matched = {};
-                    assert.match(a, A, /^\$/, false, matched, {}, null, []);
+                    this.assert.match(a, A, /^\$/, false, matched, {}, null, []);
                     replacedNth++;
                 }
                 catch (e) { }
@@ -1817,7 +1923,7 @@ export class FormalSystem {
             }
             try {
                 const matched = {};
-                assert.match(a, A, /^\$/, false, matched, {}, null, []);
+                this.assert.match(a, A, /^\$/, false, matched, {}, null, []);
                 replacedNth++;
                 if (nth === -1 || nth + 1 === replacedNth) {
                     return this.deduct({

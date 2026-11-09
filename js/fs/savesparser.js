@@ -2,6 +2,7 @@ import { AssertionSystem } from "./assertion.js";
 import { ASTParser } from "./astparser.js";
 import { initFormalSystem } from "./initial.js";
 import { RuleParser } from "./metarule.js";
+import { ASTMgr } from "./astmgr.js";
 const astparser = new ASTParser;
 export class SavesParser {
     creative = false;
@@ -10,10 +11,13 @@ export class SavesParser {
         this.bug260616fixer.fixbug260616 = true;
     }
     serializeDeductionStep(s) {
-        return [
+        const step = [
             s.deductionIdx, s.conditionIdxs,
             s.replaceValues.map(v => astparser.stringifyTight(v))
         ];
+        if (s.model)
+            step.push({ path: s.model.path.slice(), target: astparser.stringifyTight(s.model.target) });
+        return step;
     }
     serializeProposition(p) {
         const value = astparser.stringifyTight(p.value);
@@ -21,7 +25,8 @@ export class SavesParser {
         return [value, step];
     }
     deserializeDeductionStep(v) {
-        return { conditionIdxs: v[1], deductionIdx: v[0], replaceValues: v[2].map(v => astparser.parse(v)) };
+        return { conditionIdxs: v[1], deductionIdx: v[0], replaceValues: v[2].map(v => astparser.parse(v)),
+            model: v[3] ? { path: v[3].path.slice(), target: astparser.parse(v[3].target) } : undefined };
     }
     deserializeProposition(v) {
         return {
@@ -68,9 +73,9 @@ export class SavesParser {
             this.assert.expand(val, false);
         }
         catch (e) { }
-        fs.addDeduction(name, val, sd[1], sd[2]?.map(e => ({
-            deductionIdx: e[0].includes(">.a1_") ? this.fixbug260330(e[0]) : e[0].includes(":") ? this.fixbug260616(e[0]) : e[0], conditionIdxs: e[1], replaceValues: e[2].map(v => astparser.parse(v))
-        })), sd[3] ? new Set(sd[3]) : new Set());
+        fs.addDeduction(name, val, sd[1], sd[2]?.map(e => this.deserializeDeductionStep([
+            e[0].includes(">.a1_") ? this.fixbug260330(e[0]) : e[0].includes(":") ? this.fixbug260616(e[0]) : e[0], e[1], e[2], e[3]
+        ])), sd[3] ? new Set(sd[3]) : new Set());
     }
     serialize(gui) {
         const fs = gui.formalSystem;
@@ -108,9 +113,21 @@ export class SavesParser {
             if (v.length)
                 this.deserializeDeduction(k, fs, v);
         }
+        const replay = arrP?.some(v => /#(?:sat|abs|abst|absf)\(/.test(v[0]) || !!v[1]?.[3]) ||
+            Object.values(fs.deductions).some(d => fs.hasModelProof(d) || d.from.startsWith("模型解释:"));
         if (arrP)
             for (const v of arrP) {
-                fs.propositions.push(this.deserializeProposition(v));
+                const p = this.deserializeProposition(v);
+                if (p.from && replay) {
+                    fs.assert.checkGrammer(p.value, "p");
+                    const index = fs.deduct(p.from);
+                    if (!new ASTMgr().equal(fs.propositions[index].value, p.value))
+                        throw new Error("存档中的模型推理结论未通过重放核验");
+                }
+                else {
+                    fs.assert.checkGrammer(p.value, "p");
+                    fs.propositions.push(p);
+                }
             }
         return { fs, arrD, arrM };
     }
@@ -122,6 +139,7 @@ export class SavesParser {
         const skipRendering = gui.skipRendering;
         gui.skipRendering = true;
         const fsArrD = initFormalSystem(this.creative);
+        fsArrD.fs.fastmetarules = gui.formalSystem.fastmetarules;
         const fsdata = this.deserializeArr(fsArrD.fs, JSON.parse(str));
         const savedMetarules = gui.formalSystem.fastmetarules;
         gui.formalSystem = fsdata.fs;
