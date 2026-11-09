@@ -18,7 +18,7 @@ export class SavesParser {
         if (s.generalize)
             step.push({ kind: "generalize", variable: astparser.stringifySaved(s.generalize) });
         else if (s.model)
-            step.push({ path: s.model.path.slice(), target: astparser.stringifySaved(s.model.target) });
+            step.push({ path: s.model.path.slice(), target: astparser.stringifySaved(s.model.target), ...(s.model.nfPrefixes ? { nfPrefixes: s.model.nfPrefixes.slice() } : {}) });
         return step;
     }
     serializeProposition(p) {
@@ -34,7 +34,9 @@ export class SavesParser {
         else if (operation) {
             if (operation.kind !== undefined && operation.kind !== "unfold")
                 throw new Error("未知证明操作");
-            result.model = { path: operation.path.slice(), target: astparser.parseSaved(operation.target) };
+            if (operation.nfPrefixes !== undefined && (!Array.isArray(operation.nfPrefixes) || operation.nfPrefixes.some(i => !Number.isInteger(i) || i < 0 || i > operation.path.length)))
+                throw new Error("展开步骤的断言包装位置无效");
+            result.model = { path: operation.path.slice(), target: astparser.parseSaved(operation.target), nfPrefixes: operation.nfPrefixes?.slice() };
         }
         return result;
     }
