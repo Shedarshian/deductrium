@@ -43,7 +43,7 @@ jobs:
             git worktree add --detach publish-tree HEAD
             git -C publish-tree switch --orphan gh-pages
           fi
-          rsync -a --delete --exclude=.git _site/ publish-tree/
+          rsync -ac --delete --exclude=.git _site/ publish-tree/
           git -C publish-tree config user.name 'github-actions[bot]'
           git -C publish-tree config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git -C publish-tree add --all
@@ -51,4 +51,3 @@ jobs:
             git -C publish-tree commit -m '汇集正式版与模型论版本'
             git -C publish-tree push origin HEAD:gh-pages
           fi
-
