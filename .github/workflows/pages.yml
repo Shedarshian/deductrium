@@ -52,21 +52,3 @@ jobs:
             git -C publish-tree push origin HEAD:gh-pages
           fi
 
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: _site
-          include-hidden-files: true
-
-  deploy:
-    needs: assemble
-    runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Publish the combined site
-        id: deployment
-        uses: actions/deploy-pages@v4
