@@ -226,7 +226,9 @@ export class FSGui {
             this.addSpan(varnode, sat ? "⟧" : "⟩").className = "model-bracket";
             const domain = document.createElement("sup");
             domain.className = "model-domain";
-            domain.innerText = this.cmd.astparser.stringifyTight(ast.nodes[1]);
+            const domainAst = ast.nodes[1];
+            const fixedArguments = this.formalSystem.model.domainArguments(domainAst);
+            domain.innerText = domainAst.name + (fixedArguments.length ? "[" + fixedArguments.map(p => this.cmd.astparser.stringifyTight(p)).join(",") + "]" : "");
             varnode.appendChild(domain);
             const b = this.cmd.cmdBuffer;
             if (["unfold", "sat-expand", "abs-expand"].includes(b[0]) && b.length === 2 &&

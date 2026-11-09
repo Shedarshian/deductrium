@@ -39,6 +39,7 @@ export class FormalSystem {
         this.assert.verbs = this.verbs;
         this.assert.consts = this.consts;
         this.assert.modelDomainCheck = domain => this.model.checkDomain(domain);
+        this.assert.modelDomainArguments = domain => this.model.domainArguments(domain);
         this.assert.modelTemplateNameCheck = name => this.model.checkTemplateName(name);
         this.assert.modelPredicateBinding = value => this.model.predicateBinding(value);
         // A safe identity descriptor for display and legacy bookkeeping. Actual
@@ -56,9 +57,10 @@ export class FormalSystem {
         const templates = (d: Deduction): boolean => {
             if (!d || seen.has(d)) return false;
             seen.add(d);
-            return templateNames(d.value).size > 0 || !!d.steps?.some(s => s.replaceValues.some(a => templateNames(a).size > 0) || templates(this.deductions[s.deductionIdx]));
+            return containsModelOperation(d.value) || templateNames(d.value).size > 0 ||
+                !!d.steps?.some(s => s.replaceValues.some(a => containsModelOperation(a) || templateNames(a).size > 0) || templates(this.deductions[s.deductionIdx]));
         };
-        if (templates(this.deductions[name])) throw new Error("此元规则尚不能转换未绑定的谓词或列表模板，请先实例化为具体规则");
+        if (templates(this.deductions[name])) throw new Error("此旧元规则尚不能转换包含模型语法、谓词或列表模板的规则；请先实例化并显式展开");
     }
     private protectModelDefinitions(exclude: string) {
         if (Object.entries(this.deductions).some(([name, d]) => name !== exclude &&

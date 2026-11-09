@@ -52,6 +52,13 @@ export class ModelOperations {
 
     private substitute(a: AST, replacements: Map<string, AST>): AST {
         if (a.type === "replvar") return mgr.clone(replacements.get(a.name) ?? a);
+        if (isModelOperation(a)) {
+            const domain = mgr.clone(a.nodes[1]);
+            if (domain.type === "fn" || domain.type === "predtemplate") {
+                domain.nodes = [domain.nodes[0], ...domain.nodes.slice(1).map(p => this.substitute(p, replacements))];
+            }
+            return fn(a.name, this.substitute(a.nodes[0], replacements), domain);
+        }
         if (a.type === "sym" && ["V", "E", "E!", "{|", "|}"].includes(a.name)) {
             const bound = a.nodes[0];
             if (!this.plainVariable(bound)) this.fail("暂不支持带断言的绑定变量");
@@ -61,7 +68,8 @@ export class ModelOperations {
                 const free = new Set<string>(); this.fs.assert.getFreeVars(r, free);
                 if (free.has(bound.name)) this.fail("替换可能捕获变量；请先展开并换名");
             }
-            return { ...a, nodes: a.nodes.map((n, i) => i === 0 ? mgr.clone(n) : this.substitute(n, inner)) };
+            const bodyIndex = a.name === "{|" || a.name === "|}" ? 2 : 1;
+            return { ...a, nodes: a.nodes.map((n, i) => i === 0 ? mgr.clone(n) : this.substitute(n, i === bodyIndex ? inner : replacements)) };
         }
         return { ...a, nodes: a.nodes?.map(n => this.substitute(n, replacements)) };
     }
@@ -115,11 +123,28 @@ export class ModelOperations {
             if (domain.nodes?.length) this.fail("裸论域模板不能携带参数");
             this.checkTemplateName(domain.name); return;
         }
-        if (domain.type !== "replvar" || domain.name.startsWith('"')) {
-            this.fail("本阶段的论域必须是已用 mprd 定义的一元谓词名；模板和固定参数域尚未开放");
+        if (domain.type === "predtemplate" || domain.type === "fn") {
+            const slot = domain.nodes?.[0];
+            if (slot?.type !== "replvar" || slot.name !== "_" || slot.nodes?.length) this.fail("参数化论域的第一个参数必须是唯一的 _ 元素槽");
+            const containsSlot = (a: AST): boolean => a.type === "replvar" && a.name === "_" || !!a.nodes?.some(containsSlot);
+            const types = {};
+            for (const [i, a] of this.domainArguments(domain).entries()) {
+                if (containsSlot(a)) this.fail("论域只能含一个 _ 元素槽，且必须在首位");
+                if (a.type === "arglist") {
+                    if (domain.type !== "predtemplate" || i !== domain.nodes.length - 2 || a.nodes?.length || !/^\.\.\.\$[a-z_][a-z0-9_]*$/.test(a.name)) this.fail("论域尾列表只能用于谓词模板的末尾");
+                } else { this.fs.assert.checkGrammer(a, "i"); this.fs.assert.getReplVarsType(a, types, true); }
+            }
+            if (domain.type === "predtemplate") { this.checkTemplateName(domain.name); return; }
+            const d = this.inspectDefinition("dv" + domain.name);
+            if (d.kind !== "predicate" || d.parameters.length !== domain.nodes.length) this.fail("参数化论域的实际元数与 mprd 定义不符");
+            return;
         }
+        if (domain.type !== "replvar" || domain.name.startsWith('"')) this.fail("论域必须是 mprd 谓词引用，或 p(_,a,b) 形式的局部模板");
         const definition = this.inspectDefinition("dv" + domain.name);
         if (definition.kind !== "predicate" || definition.parameters.length !== 1) this.fail("论域谓词必须是一元");
+    }
+    domainArguments(domain: AST): AST[] {
+        return domain.type === "fn" || domain.type === "predtemplate" ? domain.nodes.slice(1) : [];
     }
 
     checkTemplateName(name: string) {
@@ -149,18 +174,41 @@ export class ModelOperations {
     }
 
     private guard(domain: AST, term: AST): AST {
-        return { type: domain.type === "predref" ? "predtemplate" : "fn", name: domain.name, nodes: [mgr.clone(term)] };
+        return { type: domain.type === "predref" || domain.type === "predtemplate" ? "predtemplate" : "fn", name: domain.name,
+            nodes: [mgr.clone(term), ...this.domainArguments(domain).map(a => mgr.clone(a))] };
     }
 
     private alias(source: string, domain: AST): string {
         let hash = 2166136261;
-        const key = source + ":" + parser.stringifyTight(domain);
+        const count = this.domainArguments(domain).length;
+        const key = source + ":" + domain.name + (count ? "/" + count : "");
         for (let i = 0; i < key.length; i++) hash = Math.imul(hash ^ key.charCodeAt(i), 16777619) >>> 0;
         return "model" + hash.toString(36);
     }
 
-    private recipe(source: string, domain: AST) {
-        return "模型解释:" + encodeURIComponent(JSON.stringify([source, parser.stringifyTight(domain)])) + "*";
+    private form(d: Definition, domain: AST) {
+        if (!["replvar", "fn"].includes(domain.type) || containsArgumentList(domain)) this.fail("内部定义需要已绑定的具体论域和固定参数列表");
+        const used = mgr.getVarNames(d.body, new Set<string>(), null);
+        d.parameters.forEach(p => used.add(p.name));
+        if (d.output) used.add(d.output.name);
+        const extra: AST[] = [];
+        let next = 0;
+        const actual = this.domainArguments(domain);
+        for (const _ of actual) {
+            let name: string;
+            do { name = "modelparam" + next++; } while (used.has(name) || this.fs.assert.isConst(name));
+            used.add(name); extra.push(v(name));
+        }
+        return { extra, actual, parameters: [...extra, ...d.parameters],
+            domain: extra.length ? fn(domain.name, v("_"), ...extra.map(p => mgr.clone(p))) : v(domain.name) };
+    }
+
+    private definitionName(d: Definition, domain: AST, alias: string) {
+        return (d.kind === "predicate" ? "dv" : d.kind === "constant" && !this.domainArguments(domain).length ? "dc" : "df") + alias;
+    }
+
+    private recipe(d: Definition, domain: AST) {
+        return "模型解释:" + encodeURIComponent(JSON.stringify([d.rule, parser.stringifyTight(this.form(d, domain).domain)])) + "*";
     }
 
     private relativeBody(d: Definition, domain: AST): AST {
@@ -178,19 +226,20 @@ export class ModelOperations {
     }
 
     private relativeDefinition(d: Definition, domain: AST, name: string): AST {
-        const body = this.relativeBody(d, domain);
-        if (d.kind === "predicate") return all(d.parameters, sym("<>", fn(name, ...d.parameters.map(p => mgr.clone(p))), body));
-        const value = d.kind === "constant" ? v(name) : fn(name, ...d.parameters.map(p => mgr.clone(p)));
+        const form = this.form(d, domain);
+        const body = this.relativeBody(d, form.domain);
+        if (d.kind === "predicate") return all(form.parameters, sym("<>", fn(name, ...form.parameters.map(p => mgr.clone(p))), body));
+        const value = form.parameters.length ? fn(name, ...form.parameters.map(p => mgr.clone(p))) : v(name);
         const applied = this.substitute(body, new Map([[d.output.name, value]]));
-        return sym(">", all(d.parameters, sym("E", mgr.clone(d.output), body)), all(d.parameters, applied));
+        return sym(">", all(form.parameters, sym("E", mgr.clone(d.output), body)), all(form.parameters, applied));
     }
 
     private interpretation(d: Definition, domain: AST): string {
-        if (domain.type !== "replvar") this.fail("需要先将论域模板绑定到具体的一元 mprd 谓词");
+        this.form(d, domain);
         const alias = this.alias(d.rule, domain);
-        const rule = (d.kind === "predicate" ? "dv" : d.kind === "constant" ? "dc" : "df") + alias;
+        const rule = this.definitionName(d, domain, alias);
         const existing = this.fs.deductions[rule];
-        if (!existing || existing.from !== this.recipe(d.rule, domain) || existing.steps?.length || existing.conditions.length ||
+        if (!existing || existing.from !== this.recipe(d, domain) || existing.steps?.length || existing.conditions.length ||
             !mgr.equal(existing.conclusion, this.relativeDefinition(d, domain, alias))) {
             this.fail("缺少经过核验的内部解释，请先对 " + d.rule + " 使用 sat-def");
         }
@@ -199,10 +248,10 @@ export class ModelOperations {
 
     define(source: string, domain: AST): string {
         this.checkDomain(domain);
-        if (domain.type !== "replvar") this.fail("sat-def 需要具体的一元论域谓词，不能为未绑定模板创建定义");
         const d = this.inspectDefinition(source);
+        const form = this.form(d, domain);
         const alias = this.alias(source, domain);
-        const name = (d.kind === "predicate" ? "dv" : d.kind === "constant" ? "dc" : "df") + alias;
+        const name = this.definitionName(d, domain, alias);
         if (this.fs.deductions[name]) { this.interpretation(d, domain); return name; }
         // An apparently unused name may already occur as an unregistered symbol.
         const occurs = (a: AST): boolean => a.name === alias || !!a.nodes?.some(occurs);
@@ -210,14 +259,14 @@ export class ModelOperations {
             Object.values(this.fs.deductions).some(x => occurs(x.value)) || this.fs.propositions.some(x => occurs(x.value))) {
             this.fail("内部解释名称冲突，拒绝覆盖已有符号");
         }
-        const body = this.relativeBody(d, domain);
-        const from = this.recipe(source, domain);
+        const body = this.relativeBody(d, form.domain);
+        const from = this.recipe(d, domain);
         // Reuse the existing conservative definition mechanism, retaining its existence premise.
         let created: string;
         try {
-            if (d.kind === "predicate") created = this.fs.metaNewVerb([v(alias), body, d.parameters], from);
-            else if (d.kind === "constant") created = this.fs.metaNewConstant([v(alias), d.output, body], from);
-            else created = this.fs.metaNewFunction([v(alias), d.output, body, d.parameters], from);
+            if (d.kind === "predicate") created = this.fs.metaNewVerb([v(alias), body, form.parameters], from);
+            else if (!form.parameters.length) created = this.fs.metaNewConstant([v(alias), d.output, body], from);
+            else created = this.fs.metaNewFunction([v(alias), d.output, body, form.parameters], from);
             this.interpretation(d, domain);
             return created;
         } catch (e) {
@@ -241,6 +290,48 @@ export class ModelOperations {
         return sat(a, domain);
     }
 
+    private objectFreeVars(a: AST, result = new Set<string>(), scope = new Set<string>(), item = false): Set<string> {
+        if (a.type === "arglist") this.fail("对象自由变量依赖尚未绑定的参数列表");
+        if (a.type === "replvar") {
+            if (item && !scope.has(a.name) && !this.fs.assert.isConst(a.name)) result.add(a.name);
+            return result;
+        }
+        if (isModelOperation(a)) return this.objectFreeVars(a.nodes[0], result, scope, this.fs.assert.getSubAstType(a, 0, item));
+        const q = this.fs.assert.getQuantParams(a);
+        if (q) {
+            const name = this.fs.assert.getVarName(q[0]);
+            if (!name) this.fail("自由变量分析需要可核验的绑定变量");
+            return this.objectFreeVars(q[1], result, new Set([...scope, name]), false);
+        }
+        if (a.type === "sym" && ["{|", "|}"].includes(a.name)) {
+            const name = this.fs.assert.getVarName(a.nodes[0]);
+            if (!name) this.fail("自由变量分析需要可核验的集合绑定变量");
+            this.objectFreeVars(a.nodes[1], result, scope, true);
+            return this.objectFreeVars(a.nodes[2], result, new Set([...scope, name]), a.name === "|}");
+        }
+        a.nodes?.forEach((n, i) => this.objectFreeVars(n, result, scope, this.fs.assert.getSubAstType(a, i, item)));
+        return result;
+    }
+
+    private quantify(body: AST, domain: AST): AST {
+        let bound = mgr.clone(body.nodes[0]);
+        let inner = mgr.clone(body.nodes[1]);
+        const params = this.domainArguments(domain);
+        const absence = params.map(p => this.fs.assert.nf(bound.name, p));
+        if (absence.includes(0)) this.fail("域固定参数的自由变量尚未确定，无法核验量词展开");
+        if (absence.includes(-1)) {
+            const schematic = (a: AST): boolean => a.type === "arglist" || a.type === "replvar" && a.name.startsWith("$") || !!a.nodes?.some(schematic);
+            if (schematic(inner) || params.some(schematic)) this.fail("量词需要卫生换名，请先实例化涉及的公式或项模板");
+            const names = mgr.getVarNames(body, new Set<string>(), null);
+            mgr.getVarNames(domain, names, null);
+            let index = 0, name: string;
+            do { name = "modelq" + index++; } while (names.has(name) || this.fs.assert.isConst(name));
+            inner = this.substitute(inner, new Map([[bound.name, v(name)]]));
+            bound = v(name);
+        }
+        return sym(body.name, bound, sym(body.name === "V" ? ">" : "&", this.guard(domain, bound), sat(inner, domain)));
+    }
+
     /** Only documented defining conversions, never arbitrary externally proved equivalences. */
     private one(a: AST, isItem: boolean, semantic: boolean, budget: { left: number }): AST {
         if (--budget.left < 0) this.fail("展开预算超限，未生成新定理");
@@ -252,14 +343,14 @@ export class ModelOperations {
             if (a.name === "#abst") return sym("&", this.guard(domain, body), sym("=", sat(body, domain), mgr.clone(body)));
             // Schematic formula variables have unknown free variables: no guessed guard list.
             const reject = (n: AST) => {
+                if (isModelOperation(n)) { reject(n.nodes[0]); return; }
                 if (n.type === "arglist") this.fail("参数列表的自由变量尚未确定，不能展开绝对性");
                 if (n.type === "replvar" && n.name.startsWith("$")) this.fail("公式模板的自由变量尚未确定，不能展开绝对性");
                 if (n.type === "fn" && n.name.startsWith("#") && !isModelOperation(n)) this.fail("请先处理公式内的系统断言");
                 n.nodes?.forEach(reject);
             };
             reject(body);
-            const free = new Set<string>(); this.fs.assert.getFreeVars(body, free);
-            const guards = [...free].filter(x => !this.fs.assert.isConst(x)).sort().map(x => this.guard(domain, v(x)));
+            const guards = [...this.objectFreeVars(body)].sort().map(x => this.guard(domain, v(x)));
             const iff = sym("<>", mgr.clone(body), sat(body, domain));
             return guards.length ? sym(">", guards.reduce((x, y) => sym("&", x, y)), iff) : iff;
         }
@@ -273,9 +364,10 @@ export class ModelOperations {
             if (!source) this.fail("该内部项尚无支持的定义解释；替换变量不能假定为普通变量");
             const d = this.inspectDefinition(source);
             const alias = this.interpretation(d, domain);
-            if (d.kind === "constant") return v(alias);
+            const params = this.domainArguments(domain).map(p => mgr.clone(p));
+            if (d.kind === "constant") return params.length ? fn(alias, ...params) : v(alias);
             if (body.nodes?.length !== d.parameters.length) this.fail("函数实参数量不符");
-            return fn(alias, ...body.nodes.map(t => this.term(t, domain)));
+            return fn(alias, ...params, ...body.nodes.map(t => this.term(t, domain)));
         }
         if (body.type === "sym" && ["@", "="].includes(body.name) && body.nodes?.length === 2) {
             return sym(body.name, ...body.nodes.map(t => this.term(t, domain)));
@@ -289,13 +381,12 @@ export class ModelOperations {
         if (body.type === "sym" && ["V", "E"].includes(body.name) && body.nodes?.length === 2) {
             if (!this.plainVariable(body.nodes[0])) this.fail("量词展开需要确定的普通绑定变量");
             if (!semantic && body.name === "E" && !modelSyntaxOptions.unfoldExists) this.fail("存在量词的直接展开已关闭");
-            return sym(body.name, mgr.clone(body.nodes[0]), sym(body.name === "V" ? ">" : "&",
-                this.guard(domain, body.nodes[0]), sat(body.nodes[1], domain)));
+            return this.quantify(body, domain);
         }
         if (body.type === "fn" && this.fs.verbs.has(body.name)) {
             const d = this.inspectDefinition("dv" + body.name);
             if (d.parameters.length !== body.nodes?.length) this.fail("谓词实参数量不符");
-            return fn(this.interpretation(d, domain), ...body.nodes.map(t => this.term(t, domain)));
+            return fn(this.interpretation(d, domain), ...this.domainArguments(domain).map(p => mgr.clone(p)), ...body.nodes.map(t => this.term(t, domain)));
         }
         if (body.type === "predtemplate") this.fail("请先把谓词模板及参数列表绑定为具体的 mprd 谓词");
         return this.fail("此公式结构尚无可靠的相对化展开规则");

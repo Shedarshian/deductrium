@@ -324,7 +324,7 @@ export class FSCmd {
         const b = this.cmdBuffer;
         if (b.length === 1) { this.gui.hintText.innerText = "请选择 df/dv/dc 定义规则，或输入其名称"; return; }
         this.gui.formalSystem.model.inspectDefinition(b[1]);
-        if (b.length === 2) { this.gui.hintText.innerText = "请输入已由 mprd 定义的一元论域谓词名（本阶段不接受固定参数域）"; return; }
+        if (b.length === 2) { this.gui.hintText.innerText = "请输入具体的 mprd 论域：一元谓词名，或 p(_,a,b) 形式的固定参数域"; return; }
         if (b.length !== 3) throw new Error("sat-def 参数数量错误");
         const rule = this.gui.formalSystem.model.define(b[1], this.astparser.parse(b[2], true));
         if (!this.gui.deductions.includes(rule)) this.gui.addToDeductions(rule);

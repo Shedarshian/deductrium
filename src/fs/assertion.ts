@@ -42,6 +42,7 @@ function eq(name1: string, name2: string): bool3 {
 
 export class AssertionSystem {
     modelDomainCheck: (domain: AST) => void;
+    modelDomainArguments: (domain: AST) => AST[];
     modelPredicateBinding: (value: AST) => AST;
     modelTemplateNameCheck: (name: string) => void;
     fns = new Set<string>;
@@ -164,7 +165,11 @@ export class AssertionSystem {
     }
     // fussy check whether name is nofree in V* ast, exclusions can be provided for replvar name
     nf(name: string, ast: AST, quants: AST[] = [], nameIsNot?: Set<string>): bool3 {
-        if (isModelOperation(ast)) return this.nf(name, ast.nodes[0], quants, nameIsNot);
+        if (isModelOperation(ast)) {
+            let result = this.nf(name, ast.nodes[0], quants, nameIsNot);
+            for (const p of this.modelDomainArguments?.(ast.nodes[1]) ?? []) result = and(result, this.nf(name, p, quants, nameIsNot));
+            return result;
+        }
         const astName = this.getVarName(ast);
         // ast is var
         if (ast.type === "replvar") {
@@ -291,7 +296,9 @@ export class AssertionSystem {
         }
         if (isModelOperation(ast)) {
             this.checkGrammer(ast, isItem ? "i" : "p");
-            return this.getReplVarsType(ast.nodes[0], res, this.getSubAstType(ast, 0, isItem), resfn);
+            this.getReplVarsType(ast.nodes[0], res, this.getSubAstType(ast, 0, isItem), resfn);
+            for (const p of this.modelDomainArguments?.(ast.nodes[1]) ?? []) if (p.type !== "arglist") this.getReplVarsType(p, res, true, resfn);
+            return res;
         }
         if (ast.type === "replvar") {
             res[ast.name] ??= isItem;
@@ -390,7 +397,11 @@ export class AssertionSystem {
     getFreeVars(ast: AST, res: Set<string>, scope: Set<string> = new Set) {
         if (ast.type === "predref") return;
         if (ast.type === "arglist") { res.add(ast.name); return; }
-        if (isModelOperation(ast)) return this.getFreeVars(ast.nodes[0], res, scope);
+        if (isModelOperation(ast)) {
+            this.getFreeVars(ast.nodes[0], res, new Set(scope));
+            for (const p of this.modelDomainArguments?.(ast.nodes[1]) ?? []) this.getFreeVars(p, res, new Set(scope));
+            return;
+        }
         const varname = this.getVarName(ast);
         if (varname) {
             if (!scope.has(varname)) res.add(varname);
@@ -419,7 +430,11 @@ export class AssertionSystem {
 
     }
     getVarNamesAndIsNots(ast: AST, res: { [name: string]: Set<string> }, reg: RegExp, scope: Set<string> = new Set): { [name: string]: Set<string> } {
-        if (isModelOperation(ast)) return this.getVarNamesAndIsNots(ast.nodes[0], res, reg, scope);
+        if (isModelOperation(ast)) {
+            this.getVarNamesAndIsNots(ast.nodes[0], res, reg, new Set(scope));
+            for (const p of this.modelDomainArguments?.(ast.nodes[1]) ?? []) this.getVarNamesAndIsNots(p, res, reg, new Set(scope));
+            return res;
+        }
         const varname = this.getVarName(ast);
         if (varname) {
             if (!varname.match(reg)) return res;
@@ -1049,6 +1064,7 @@ export class AssertionSystem {
     checkGrammer(
         ast: AST, type: "m" | "d" | "p" | "v" | "i",
     ) {
+        if (ast.type === "fn" && ast.name === "#args") throw new Error("#args 只用于输入参数列表，不能作为数学项或公式");
         if (ast.type === "predtemplate") {
             if (type !== "p") throw new Error("谓词模板调用只能出现在公式位置");
             if (!Array.isArray(ast.nodes)) throw new Error("谓词模板缺少参数列表");

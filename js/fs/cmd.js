@@ -362,7 +362,7 @@ export class FSCmd {
         }
         this.gui.formalSystem.model.inspectDefinition(b[1]);
         if (b.length === 2) {
-            this.gui.hintText.innerText = "请输入已由 mprd 定义的一元论域谓词名（本阶段不接受固定参数域）";
+            this.gui.hintText.innerText = "请输入具体的 mprd 论域：一元谓词名，或 p(_,a,b) 形式的固定参数域";
             return;
         }
         if (b.length !== 3)

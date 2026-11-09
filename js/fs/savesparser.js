@@ -1,8 +1,8 @@
-import { AssertionSystem } from "./assertion.js";
 import { ASTParser } from "./astparser.js";
 import { initFormalSystem } from "./initial.js";
 import { RuleParser } from "./metarule.js";
 import { ASTMgr } from "./astmgr.js";
+import { containsModelOperation, templateNames } from "./model.js";
 const astparser = new ASTParser;
 export class SavesParser {
     creative = false;
@@ -64,15 +64,17 @@ export class SavesParser {
         }
         return s;
     }
-    assert = new AssertionSystem;
     deserializeDeduction(name, fs, sd) {
         // deserialized data is reliable, no need to regen tempvars
         // fix bugs for nested #nf funcs 26-7-5
         const val = astparser.parseSaved(sd[0]);
         try {
-            this.assert.expand(val, false);
+            fs.assert.expand(val, false);
         }
-        catch (e) { }
+        catch (e) {
+            if (containsModelOperation(val) || templateNames(val).size)
+                throw e;
+        }
         fs.addDeduction(name, val, sd[1], sd[2]?.map(e => this.deserializeDeductionStep([
             e[0].includes(">.a1_") ? this.fixbug260330(e[0]) : e[0].includes(":") ? this.fixbug260616(e[0]) : e[0], e[1], e[2], e[3]
         ])), sd[3] ? new Set(sd[3]) : new Set());
@@ -137,26 +139,38 @@ export class SavesParser {
     }
     deserialize(gui, str) {
         const skipRendering = gui.skipRendering;
+        const previous = { fs: gui.formalSystem, deductions: gui.deductions, metarules: gui.metarules };
         gui.skipRendering = true;
-        const fsArrD = initFormalSystem(this.creative);
-        fsArrD.fs.fastmetarules = gui.formalSystem.fastmetarules;
-        const fsdata = this.deserializeArr(fsArrD.fs, JSON.parse(str));
-        const savedMetarules = gui.formalSystem.fastmetarules;
-        gui.formalSystem = fsdata.fs;
-        gui.formalSystem.fastmetarules = savedMetarules;
-        gui.deductions = fsdata.arrD;
-        // 25-11-25: bug fix player's progress
-        if (gui.deductions.includes("apn3") && !gui.deductions.includes("apn4") && !gui.deductions.includes("apn5")) {
-            gui.deductions.push("apn4", "apn5");
+        try {
+            const fsArrD = initFormalSystem(this.creative);
+            fsArrD.fs.fastmetarules = gui.formalSystem.fastmetarules;
+            const fsdata = this.deserializeArr(fsArrD.fs, JSON.parse(str));
+            const savedMetarules = gui.formalSystem.fastmetarules;
+            gui.formalSystem = fsdata.fs;
+            gui.formalSystem.fastmetarules = savedMetarules;
+            gui.deductions = fsdata.arrD;
+            // 25-11-25: bug fix player's progress
+            if (gui.deductions.includes("apn3") && !gui.deductions.includes("apn4") && !gui.deductions.includes("apn5")) {
+                gui.deductions.push("apn4", "apn5");
+            }
+            if (fsdata.arrM[0]) {
+                gui.metarules = Array.from(new Set(fsdata.arrM.slice(1)));
+                this.deserializeMetaMacro(gui, fsdata.arrM[0]);
+            }
+            gui.skipRendering = skipRendering;
+            gui.updatePropositionList(true);
+            gui.updateDeductionList();
+            gui.updateMetaRuleList(true);
         }
-        if (fsdata.arrM[0]) {
-            gui.metarules = Array.from(new Set(fsdata.arrM.slice(1)));
-            this.deserializeMetaMacro(gui, fsdata.arrM[0]);
+        catch (e) {
+            gui.formalSystem = previous.fs;
+            gui.deductions = previous.deductions;
+            gui.metarules = previous.metarules;
+            throw e;
         }
-        gui.skipRendering = skipRendering;
-        gui.updatePropositionList(true);
-        gui.updateDeductionList();
-        gui.updateMetaRuleList(true);
+        finally {
+            gui.skipRendering = skipRendering;
+        }
     }
 }
 //# sourceMappingURL=savesparser.js.map
