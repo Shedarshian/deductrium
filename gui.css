@@ -1,0 +1,646 @@
+.before-list-wrapper:hover {
+    cursor: pointer;
+    color: rgb(145, 105, 180);
+}
+
+.before-list-wrapper {
+    padding-left: 0.5em;
+    padding-bottom: 0.2em;
+    border-radius: 20px;
+    display: block;
+    background-color: ghostwhite;
+    border: solid 1px #ccc;
+}
+
+.list-wrapper {
+    min-height: 100px;
+    max-height: 300px;
+    overflow-y: auto;
+    width: 100%;
+    border: solid;
+    margin-top: 0.5em;
+    margin-bottom: 1em;
+    user-select: none;
+    transition: max-height 0.5s ease, min-height 0.5s ease, opacity 0.3s ease, margin-top 0.3s ease, margin-bottom 0.3s ease;
+    opacity: 1;
+}
+
+.list-wrapper.hide-animation {
+    max-height: 0;
+    opacity: 0;
+    min-height: 0;
+    margin-top: 0;
+    margin-bottom: 0;
+    pointer-events: none;
+}
+
+@keyframes identifier {}
+
+
+.constant {
+    color: blue;
+}
+
+.constructors {
+    color: brown;
+}
+
+.ind_fn {
+    color: darkorchid;
+}
+
+.compute_eqs {
+    color:lightseagreen;
+}
+
+.macro {
+    color: darkblue;
+}
+
+.fn {
+    color: blueviolet;
+    line-break: auto;
+}
+
+.verb {
+    color: #a60;
+    line-break: auto;
+}
+
+.sysfn {
+    color: darkblue;
+    line-break: auto;
+}
+
+.rule-node {
+    color: indianred;
+}
+
+.rule-token {
+    color: grey;
+}
+
+.rule-token:hover,
+.cmd .rule-token {
+    color: darkblue;
+}
+
+.rule-cond {
+    color: darkorange;
+}
+
+.rule-highlighted {
+    background-color: rgba(255, 128, 0, 0.5);
+    border-radius: 4px;
+}
+
+.error-color {
+    color: red;
+}
+
+#deduct-list {
+    transition: height 0.3s ease;
+    overflow-y: hidden;
+}
+
+.p-highlighted-before {
+    color: red;
+}
+
+.p-highlighted-after {
+    color: blue;
+}
+
+.p-match-failed {
+    background-color: #CCC !important;
+}
+
+.freeVar {
+    font-weight: bold;
+    line-break: auto;
+}
+
+.boundedVar {
+    color: #595;
+    line-break: auto;
+}
+
+.universe {
+    color: rgb(107, 107, 107);
+}
+
+.replvar {
+    color: brown;
+    line-break: auto;
+}
+
+.item:not(.constant) {
+    font-family: 'Times New Roman', Times, serif;
+    font-style: italic;
+    font-weight: bolder;
+}
+
+.nf * {
+    color: gray;
+}
+
+.vnf * {
+    color: gray;
+}
+
+.rp-nth * {
+    color: blue;
+}
+
+span.omit-nf {
+    border-bottom: lightgreen solid;
+    background-color: rgba(0, 255, 0, 0.1);
+    border-radius: 4px;
+    line-break: auto;
+}
+
+span.omit-nf.rp {
+    border-bottom: lightpink solid;
+    background-color: rgba(255, 0, 255, 0.1);
+    border-radius: 4px;
+    line-break: auto;
+}
+
+sub.omit-nf,
+sup.omit-nf {
+    font-size: xx-small;
+}
+
+.dir-open::before {
+    content: "📂 ";
+}
+
+
+
+.dir-open {
+    color: red;
+}
+
+.dir-close {
+    color: darkblue;
+}
+
+.dir-close::before {
+    content: "📁 ";
+}
+
+
+
+
+span.dir-val {
+    font-weight: bold;
+}
+
+div.dir-val {
+    background-color: #f0f0f0;
+    border-bottom: solid 1px #ccc;
+    border-top: solid 1px #ccc;
+    padding-left: 3px;
+}
+
+.dir-info {
+    font-size: small;
+    filter: grayscale();
+}
+
+.dir-bar {
+    color: #999;
+    flex-shrink: 0;
+}
+
+
+#panel>button {
+    border-width: 1px;
+    border-radius: 6px;
+    background-color: #f4ffe2;
+    font-size: 1.2em;
+    margin: 5px;
+    padding: 10px 30px 10px 30px;
+}
+
+#panel>button:hover {
+    border-color: coral;
+    color: red;
+}
+
+#panel>div {
+    display: none;
+}
+
+#panel>div.show {
+    display: block;
+}
+
+
+
+.list-wrapper::-webkit-scrollbar-thumb {
+    background-color: gray;
+    border-radius: 4px;
+}
+
+.list-wrapper::-webkit-scrollbar {
+    background-color: lightgray;
+    height: 8px;
+    width: 8px;
+}
+
+h1 {
+    text-align: center;
+}
+
+.footer .right {
+    float: right;
+}
+
+.cmd-btns button {
+    width: 120px;
+    height: 40px;
+}
+
+.list {
+    font-family: 'Lucida Sans', 'Lucida Sans Regular', 'Lucida Grande', 'Lucida Sans Unicode', Geneva, Verdana, sans-serif;
+
+    cursor: pointer;
+    display: grid;
+    width: 100%;
+    min-width: 500px;
+    grid-template-columns: min-content auto repeat(6, max-content);
+
+}
+
+.list .idx {
+    border-right: 2px solid #999;
+    /* width: 32px; */
+    padding-left: 0.5em;
+    padding-right: 0.5em;
+    font-size: small;
+    background-color: ivory;
+    text-align: center;
+    line-height: 25px;
+    /* min-width: 32px; */
+}
+
+.list .dir-idx {
+    font-size: 0px !important;
+    background-color: #f0f0f0;
+    border-bottom: solid 1px #ccc;
+    border-top: solid 1px #ccc;
+}
+
+.idx.dir-idx:nth-of-type(16n+1),
+div.dir-val:nth-of-type(16n+2),
+div.dir-info:nth-of-type(16n+3),
+div.dir-info:nth-of-type(16n+4),
+div.dir-info:nth-of-type(16n+5),
+div.dir-info:nth-of-type(16n+6),
+div.dir-info:nth-of-type(16n+7) {
+    background-color: #E1E1E1;
+}
+
+div.dir-val:not(.dir-info):hover {
+    background-color: beige;
+}
+
+.dragging {
+    opacity: 0.4;
+}
+
+.dragging-bottom {
+    border-bottom: 2px solid orange !important;
+}
+
+.dragging-top {
+    border-top: 2px solid orange !important;
+}
+
+.macro-substep {
+    color: #999;
+}
+
+
+.val:nth-of-type(16n+2),
+.info:nth-of-type(16n+3),
+.info:nth-of-type(16n+4),
+.info:nth-of-type(16n+5),
+.info:nth-of-type(16n+6),
+.inhabitat div.wrapper:nth-of-type(2n+1),
+.info:nth-of-type(16n+7) {
+    background-color: aliceblue;
+}
+
+
+.list .val {
+    width: 100%;
+    padding-left: 3px;
+    line-break: anywhere;
+    display: flex;
+    align-items: flex-start;
+}
+
+
+.p-unused.val,
+.p-unused.info {
+    background-color: #FFC;
+}
+
+.p-unused.val:nth-of-type(16n+2),
+.p-unused.info:nth-of-type(16n+3),
+.p-unused.info:nth-of-type(16n+4),
+.p-unused.info:nth-of-type(16n+5),
+.p-unused.info:nth-of-type(16n+6),
+.p-unused.info:nth-of-type(16n+7) {
+    background-color: #FFA;
+}
+
+.list .val:hover {
+    background-color: orange;
+}
+
+.footer {
+    position: fixed;
+    bottom: 0px;
+    left: 8px;
+    right: 8px;
+    background-color: rgba(240, 240, 230, 0.9);
+    border-radius: 5px;
+    padding: 5px;
+}
+
+.footer input {
+    width: calc(100% - 8px);
+}
+
+.info {
+    float: right;
+    color: #999;
+    right: 36px;
+}
+
+#hint {
+    max-height: 100px;
+    overflow-y: scroll;
+}
+
+.highlighted,
+.highlighted span {
+    color: white;
+}
+
+text .highlighted,
+text .highlighted span {
+    color: black;
+    background-color: rgba(255, 255, 0, 0.5);
+    border-radius: 4px;
+}
+
+#hyper {
+    width: 100%;
+    height: 80vh;
+}
+
+@keyframes hint-anim {
+    0% {
+        color: rgba(255, 0, 0, 0);
+        top: 40%;
+        right: 40%;
+
+    }
+
+    20% {
+        color: rgba(255, 0, 0, 1);
+        background-color: rgba(255, 255, 255, 0.2);
+        top: 0px;
+        right: 0px;
+    }
+
+    80% {
+        color: rgba(255, 0, 0, 0.6);
+        background-color: rgba(255, 255, 255, 1);
+    }
+
+    100% {
+        background-color: rgba(255, 255, 255, 0);
+        color: rgba(255, 0, 0, 0);
+
+    }
+}
+
+button {
+    user-select: none;
+}
+
+.danger {
+    font-weight: bold;
+    color: red;
+}
+
+div.hintbar {
+    top: 0px;
+    right: 0px;
+    position: fixed;
+    animation-name: hint-anim;
+    animation-duration: 5s;
+    animation-fill-mode: both;
+}
+
+.inhabitat-modify {
+    border-radius: 4px;
+    border: 0;
+    background-color: #AAA;
+    color: white;
+    overflow: hidden;
+    margin-right: 1px;
+}
+
+.inhabitat-modify:hover {
+    color: #8F0;
+}
+
+.inhabitat-div {
+    width: calc(100% - 32px);
+    display: inline-block;
+}
+
+.inhabitat-div:hover {
+    background-color: orange;
+}
+
+.infering {
+    border: solid;
+    border-color: rgb(255, 242, 0);
+}
+
+div.wrapper.error {
+    border: solid 1px;
+    border-color: red;
+    background-color: rgb(255,210,210) !important;
+}
+
+
+.inhabitat input {
+    width: calc(100% - 32px);
+}
+
+.mediumlighted {
+    background-color: rgba(0, 0, 0, 0.1);
+    border-radius: 2px;
+}
+
+#tactic-input {
+    width: calc(100% - 64px);
+}
+
+#tactic-errmsg {
+    color: red;
+}
+
+#tactic-hint .highlighted {
+    color: orange;
+}
+
+#tactic-list .highlighted {
+    color: orange;
+}
+
+.hide {
+    display: none;
+}
+
+.blocked {
+    display: block;
+}
+
+.float-type {
+    position: absolute;
+    border: solid;
+    background-color: rgba(240, 240, 230, 0.9);
+    border-radius: 2px;
+    width: max-content;
+}
+
+.achievement {
+    display: flex;
+}
+
+.achievement div {
+    width: 120px;
+    min-height: 2.5em;
+    background-color: beige;
+    text-align: center;
+    align-content: center;
+    color: #AAA;
+    border: solid;
+    margin: 2px;
+    display: grid;
+}
+
+.achievement div.achieved {
+    width: 120px;
+    min-height: 2.5em;
+    background-color: greenyellow;
+    color: black;
+    text-align: center;
+    align-content: center;
+    border: solid;
+    margin: 2px;
+}
+
+.achievement.locked div::before {
+    content: "?";
+    font-size: 40px;
+}
+
+.achievement.locked div {
+    font-size: 0em;
+}
+
+div#loading div {
+    width: 90vw;
+    height: 90vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+
+.autocomplete-list {
+    position: absolute;
+    bottom: 30px;
+    font-size: small;
+    left: 0;
+    background: white;
+    border: 1px solid #aaa;
+    list-style: none;
+    margin: 0px 5px;
+    padding: 0;
+    width: calc(100% - 10px);
+    max-height: 150px;
+    overflow-y: auto;
+    z-index: 10;
+    opacity: 0.9;
+}
+
+.autocomplete-list li {
+    padding: 5px 10px;
+    cursor: pointer;
+}
+
+.autocomplete-list li:nth-child(even) {
+    background: #f0f0f0;
+}
+
+.autocomplete-list li:hover {
+    background: #b1d3ef;
+    color: white;
+}
+
+.autocomplete-list li.active {
+    background: #0078d7;
+    color: white;
+}
+
+.autocomplete-list li {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 5px 10px;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.autocomplete-list li span.cmd {
+    flex: 0 0 auto;
+    margin-right: 8px;
+}
+
+.autocomplete-list li span.hint {
+    flex: 1 1 auto;
+    text-align: right;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: #666;
+    font-size: 12px;
+}
+
+.restart {
+    color: #888;
+    font-family: monospace;
+    position: fixed;
+    left: 5px;
+    bottom: 5px;
+    font-size: 2em;
+    background-color: rgba(255, 255, 255, 0.6);
+}
+
+.restart label:hover {
+    color: red;
+    cursor: pointer;
+}

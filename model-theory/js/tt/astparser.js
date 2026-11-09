@@ -1,0 +1,374 @@
+import { TR } from "../lang.js";
+export const debugBoundVarId = false;
+export class ASTParser {
+    keywords = [":=", "[[", "]]", "->", "~=", "==="];
+    specialwords = ["Sum", "S1", "S2", "S3", "S4", "LiftU", "South", "Sus", "List", "LEM", "Pushout", "Wedge"];
+    // keywords = [":=", "[[", "]]", "[", "]", "->", "~=", "===", "=", "@ind_Sum", "ind_Sum", "@Sum", "Sum", "@rec_S1", "rec_S1", "@ind_S1", "ind_S1", "S1", "@ind_Prod", "ind_Prod", "@Prod", "Prod", "@ind_LiftU", "ind_LiftU", "@LiftU", "LiftU", "@South", "@ind_Sus", "ind_Sus", "@Sus", "South", "Sus"];
+    symChar = ".:,()PWSLX~*+=[]";
+    ast;
+    cursor = 0;
+    tokens;
+    token;
+    stringify(ast, omitParenthese) {
+        if (!ast)
+            return TR('表达式丢失');
+        const nd = ast.nodes;
+        if (ast.type === "[]") {
+            return `[${this.stringify(nd[0])}]`;
+        }
+        if (ast.type === "[[]]") {
+            return `[[${this.stringify(nd[0])}]]`;
+        }
+        if (ast.type === "->") {
+            return `(${this.stringify(nd[0])}→${this.stringify(nd[1])})`;
+        }
+        if (ast.type === "===") {
+            return `(${this.stringify(nd[0])} ≡ ${this.stringify(nd[1])})`;
+        }
+        if (ast.type === "=") {
+            return `(${this.stringify(nd[0])}=${this.stringify(nd[1])})`;
+        }
+        if (ast.type === ":") {
+            return `(${this.stringify(nd[0])} : ${this.stringify(nd[1])})`;
+        }
+        if (ast.type === ":=") {
+            return `(${this.stringify(nd[0])} := ${this.stringify(nd[1])})`;
+        }
+        if (ast.type === "~") {
+            return `(${this.stringify(nd[0])}~${this.stringify(nd[1])})`;
+        }
+        if (ast.type === "*") {
+            return `(${this.stringify(nd[0])}▪${this.stringify(nd[1])})`;
+        }
+        if (ast.type === ",") {
+            return `(${this.stringify(nd[0])},${this.stringify(nd[1])})`;
+        }
+        if (ast.type === "+") {
+            return `(${this.stringify(nd[0])}+${this.stringify(nd[1])})`;
+        }
+        if (ast.type === "~=") {
+            return `(${this.stringify(nd[0])}≃${this.stringify(nd[1])})`;
+        }
+        if (ast.type === "X") {
+            return `(${this.stringify(nd[0])}×${this.stringify(nd[1])})`;
+        }
+        if (ast.type === "L") {
+            let s = "";
+            if (debugBoundVarId && ast.bondVarId)
+                s = "{" + ast.bondVarId + "}";
+            return `(λ${ast.name + s}:${this.stringify(nd[0], true)}.${this.stringify(nd[1], true)})`;
+        }
+        if (ast.type === "P") {
+            let s = "";
+            if (debugBoundVarId && ast.bondVarId)
+                s = "{" + ast.bondVarId + "}";
+            return `(Π${ast.name + s}:${this.stringify(nd[0], true)},${this.stringify(nd[1], true)})`;
+        }
+        if (ast.type === "W") {
+            let s = "";
+            if (debugBoundVarId && ast.bondVarId)
+                s = "{" + ast.bondVarId + "}";
+            return `(W${ast.name + s}:${this.stringify(nd[0], true)},${this.stringify(nd[1], true)})`;
+        }
+        if (ast.type === "S") {
+            let s = "";
+            if (debugBoundVarId && ast.bondVarId)
+                s = "{" + ast.bondVarId + "}";
+            return `(Σ${ast.name + s}:${this.stringify(nd[0], true)},${this.stringify(nd[1], true)})`;
+        }
+        if (ast.type === "var") {
+            let s = "";
+            if (debugBoundVarId && ast.bondVarId)
+                s = "{" + ast.bondVarId + "}";
+            return ast.name + s;
+        }
+        if (ast.type === "apply") {
+            if (ast.nodes[0].name === "U" && ast.nodes[1].name === "@0")
+                return `U`;
+            if (ast.nodes[0].name === "U")
+                return `(${this.stringify(nd[0])}${this.stringify(nd[1])})`;
+            if (omitParenthese)
+                return `${this.stringify(nd[0], omitParenthese)} ${this.stringify(nd[1])}`;
+            return `(${this.stringify(nd[0], true)} ${this.stringify(nd[1])})`;
+        }
+    }
+    parse(s) {
+        this.cursor = 0;
+        this.tokenise(s.replaceAll("Σ", " S ").replaceAll("λ", " L ").replaceAll("Π", " P ").replaceAll("≃", "~=").replaceAll("▪", "*").replaceAll("≡", "===").replaceAll("→", "->").replaceAll("×", "X"));
+        this.nextSym();
+        const ret = this.type();
+        if (this.tokens.length !== this.cursor - 1) {
+            if (this.token === ":" || this.token === "===" || this.token === ":=") {
+                const token = this.token;
+                this.nextSym();
+                const postfix = this.type();
+                if (!postfix)
+                    throw TR("不完整的表达式");
+                if (this.tokens.length !== this.cursor - 1) {
+                    if (token === ":=" && this.token === ":") {
+                        // def := expr : type
+                        this.nextSym();
+                        const type = this.type();
+                        if (!type)
+                            throw TR("不完整的表达式");
+                        return {
+                            type: token, name: "", nodes: [ret, {
+                                    type: ":", name: "", nodes: [postfix, type]
+                                }]
+                        };
+                    }
+                    throw TR("未知的语法错误");
+                }
+                return { type: token, name: "", nodes: [ret, postfix] };
+            }
+            else {
+                throw TR("未知的语法错误");
+            }
+        }
+        return ret;
+    }
+    tokenise(s) {
+        for (let i = 0; i < this.keywords.length; i++) {
+            s = s.replaceAll(this.keywords[i], " #keyword" + i + " ");
+        }
+        for (let i = 0; i < this.specialwords.length; i++) {
+            s = s.replaceAll(this.specialwords[i], "#specialword" + this.specialwords[i]);
+        }
+        let word = "";
+        const arr = [];
+        for (let i = 0; i < s.length; i++) {
+            const c = s[i];
+            if (this.symChar.includes(c)) {
+                if ((c === "P" || c === "L" || c === "S" || c === "W")) {
+                    const lastword = word[word.length - 1];
+                    if (lastword && !this.symChar.includes(lastword)) {
+                        word += c;
+                        continue;
+                    }
+                }
+                if (word !== "") {
+                    arr.push(word);
+                    word = "";
+                }
+                arr.push(c);
+                continue;
+            }
+            if (c === " ") {
+                if (word !== "") {
+                    arr.push(word);
+                    word = "";
+                }
+                continue;
+            }
+            word += c;
+        }
+        if (word !== "") {
+            arr.push(word);
+        }
+        this.tokens = arr.map(token => token.startsWith("#keyword") ? this.keywords[token.slice(8)] : token.replace("：", ":").replaceAll("#specialword", ""));
+    }
+    prevToken(index) {
+        return this.tokens[this.cursor - index - 1];
+    }
+    nextSym() {
+        this.token = this.tokens[this.cursor++];
+    }
+    moveCursor(cursor) {
+        this.cursor = cursor;
+        this.token = this.tokens[this.cursor - 1];
+    }
+    typeTerm3() {
+        let val;
+        if (this.acceptSym("[[")) {
+            val = { type: "[[]]", nodes: [this.type()], name: "" };
+            if (this.tokens[this.cursor - 1] !== "]]") {
+                if (!this.acceptSym("]"))
+                    throw TR("语法错误：未找到符号“]]”");
+                if (this.tokens[this.cursor - 1] === "]]")
+                    this.token = this.tokens[this.cursor - 1] = "]";
+                else if (!this.acceptSym("]"))
+                    throw TR("语法错误：未找到符号“]]”");
+            }
+            else
+                this.nextSym();
+        }
+        else if (this.acceptSym("[")) {
+            val = { type: "[]", nodes: [this.type()], name: "" };
+            if (this.tokens[this.cursor - 1] === "]")
+                this.nextSym();
+            else if (this.tokens[this.cursor - 1] === "]]")
+                this.token = this.tokens[this.cursor - 1] = "]";
+        }
+        else if (this.acceptSym("(")) {
+            val = this.type();
+            if (val.type === "var" && this.acceptSym(":")) {
+                const t = this.type();
+                this.expectSym(")");
+                this.expectSym("->");
+                val = { type: "P", name: val.name, nodes: [t, this.type()] };
+            }
+            else {
+                while (this.token === ",") {
+                    this.nextSym();
+                    val = {
+                        type: ",", name: "", nodes: [
+                            val, this.type()
+                        ]
+                    };
+                }
+                this.expectSym(")");
+            }
+        }
+        else if (this.acceptSym("L")) {
+            this.expectVar();
+            const param = this.prevToken(1);
+            this.expectSym(":");
+            const paramType = this.type();
+            if (!(this.acceptSym(".") || this.acceptSym(",")))
+                throw TR("λ(L)未匹配“.”号");
+            const fnbody = this.type();
+            val = { type: "L", name: param, nodes: [paramType, fnbody] };
+        }
+        else if (this.acceptSym("P")) {
+            this.expectVar();
+            const param = this.prevToken(1);
+            this.expectSym(":");
+            const paramType = this.type();
+            if (!(this.acceptSym(".") || this.acceptSym(",")))
+                throw TR("Π(P)未匹配“,”号");
+            const fnbody = this.type();
+            val = { type: "P", name: param, nodes: [paramType, fnbody] };
+        }
+        else if (this.acceptSym("S")) {
+            this.expectVar();
+            const param = this.prevToken(1);
+            this.expectSym(":");
+            const paramType = this.type();
+            if (!(this.acceptSym(".") || this.acceptSym(",")))
+                throw TR("Σ(S)未匹配“,”号");
+            const fnbody = this.type();
+            val = { type: "S", name: param, nodes: [paramType, fnbody] };
+        }
+        else if (this.acceptSym("W")) {
+            this.expectVar();
+            const param = this.prevToken(1);
+            this.expectSym(":");
+            const paramType = this.type();
+            if (!(this.acceptSym(".") || this.acceptSym(",")))
+                throw TR("W未匹配“,”号");
+            const fnbody = this.type();
+            val = { type: "W", name: param, nodes: [paramType, fnbody] };
+        }
+        else if (this.acceptVar()) {
+            const name = this.prevToken(1);
+            const isapply = this.prevToken(0);
+            if (name === "U" && isapply !== "(") {
+                val = {
+                    type: "apply", name: "", nodes: [
+                        { type: "var", name: "U" }, { type: "var", name: "@0" }
+                    ]
+                };
+            }
+            else if (name.startsWith("U") && name !== "U@" && isapply !== "(") {
+                val = {
+                    type: "apply", name: "", nodes: [
+                        { type: "var", name: "U" },
+                        { type: "var", name: ("0123456789".includes(name[1]) ? "@" : "") + name.slice(1) }
+                    ]
+                };
+            }
+            else {
+                val = { type: "var", name: this.prevToken(1) };
+            }
+        }
+        else {
+            throw TR("表达式不完整");
+        }
+        return val;
+    }
+    typeTerm2() {
+        let val = this.typeTerm();
+        while (this.token === "*") {
+            const token = this.token;
+            this.nextSym();
+            val = { type: token, name: "", nodes: [val, this.typeTerm()] };
+        }
+        return val;
+    }
+    typeTerm1() {
+        let val = this.typeTerm2();
+        while (this.token === "~" || this.token === "~=" || this.token === "=") {
+            const token = this.token;
+            this.nextSym();
+            val = { type: token, name: "", nodes: [val, this.typeTerm2()] };
+        }
+        return val;
+    }
+    typeTerm0half() {
+        let val = this.typeTerm1();
+        while (this.token === "X") {
+            const token = this.token;
+            this.nextSym();
+            val = { type: token, name: "", nodes: [val, this.typeTerm1()] };
+        }
+        return val;
+    }
+    typeTerm0() {
+        let val = this.typeTerm0half();
+        while (this.token === "+") {
+            const token = this.token;
+            this.nextSym();
+            val = { type: token, name: "", nodes: [val, this.typeTerm0half()] };
+        }
+        return val;
+    }
+    type() {
+        const arr = [this.typeTerm0()];
+        while (this.token === "->") {
+            this.nextSym();
+            arr.push(this.typeTerm0());
+        }
+        let val = arr.pop();
+        let val1;
+        while (val1 = arr.pop()) {
+            val = { type: "->", name: "", nodes: [val1, val] };
+        }
+        return val;
+    }
+    typeTerm() {
+        let val = this.typeTerm3();
+        while (this.token && this.token !== "]]" && this.token !== "]" && this.token !== ")" && this.token !== ":" && this.token !== "." && this.token !== "," && this.token !== ":=" && this.token !== "===" && this.token !== "=" && this.token !== "~=" && this.token !== "X" && this.token !== "*" && this.token !== "->" && this.token !== "+") {
+            val = { type: "apply", name: "", nodes: [val, this.typeTerm3()] };
+        }
+        if (!val)
+            throw TR("表达式不完整");
+        return val;
+    }
+    acceptVar() {
+        if (!this.symChar.includes(this.token) || this.token.length > 1) {
+            if (!this.token)
+                return false; //eof
+            this.nextSym();
+            return true;
+        }
+        return false;
+    }
+    expectVar() {
+        if (this.acceptVar())
+            return true;
+        throw TR(`语法错误：未找到变量`);
+    }
+    acceptSym(s) {
+        if (s === this.token) {
+            this.nextSym();
+            return true;
+        }
+        return false;
+    }
+    expectSym(s) {
+        if (this.acceptSym(s))
+            return true;
+        throw TR(`语法错误：未找到符号"`) + s + `"`;
+    }
+}
+//# sourceMappingURL=astparser.js.map
