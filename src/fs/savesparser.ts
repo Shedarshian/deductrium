@@ -135,6 +135,7 @@ export class SavesParser {
         for (const [k, v] of Object.entries(dictD)) {
             if ((v as any[]).length) this.deserializeDeduction(k, fs, v as SerilizedDeduction);
         }
+        fs.model.validateInterpretations();
         this.restoreMetaMacros(fs, arrM?.[0]);
         for (const d of Object.values(fs.deductions)) if (d.induction) fs.model.validateInductionDefinition(d);
         const replay = arrP?.some(v => v[0].startsWith("@model-v1:") || /#(?:sat|abs|abst|absf)\(/.test(v[0]) || !!v[1]?.[3] || v[1]?.[2]?.some(s => s.startsWith("@model-v1:"))) ||

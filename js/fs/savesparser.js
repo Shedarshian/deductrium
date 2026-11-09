@@ -136,6 +136,7 @@ export class SavesParser {
             if (v.length)
                 this.deserializeDeduction(k, fs, v);
         }
+        fs.model.validateInterpretations();
         this.restoreMetaMacros(fs, arrM?.[0]);
         for (const d of Object.values(fs.deductions))
             if (d.induction)

@@ -29,6 +29,8 @@ export class ModelOperations {
     constructor(fs) {
         this.fs = fs;
     }
+    // Ephemeral validation context, never a saved definition/binding registry.
+    interpretationChecks;
     fail(message) { throw new Error(message); }
     plainVariable(a) {
         return a?.type === "replvar" && !a.name.startsWith("$") &&
@@ -283,15 +285,60 @@ export class ModelOperations {
         return sym(">", all(form.parameters, sym("E", mgr.clone(d.output), body)), all(form.parameters, applied));
     }
     interpretation(d, domain) {
+        this.checkDomain(domain);
         this.form(d, domain);
+        const root = !this.interpretationChecks;
+        const checks = this.interpretationChecks ??= { active: new Set(), left: 4096 };
         const alias = this.alias(d.rule, domain);
         const rule = this.definitionName(d, domain, alias);
-        const existing = this.fs.deductions[rule];
-        if (!existing || existing.from !== this.recipe(d, domain) || existing.steps?.length || existing.conditions.length ||
-            !mgr.equal(existing.conclusion, this.relativeDefinition(d, domain, alias))) {
-            this.fail("缺少经过核验的内部解释，请先对 " + d.rule + " 使用 sat-def");
+        if (checks.active.has(rule) || checks.active.size >= 128 || --checks.left < 0) {
+            if (root)
+                this.interpretationChecks = undefined;
+            this.fail("内部解释的依赖循环或核验预算超限");
         }
-        return alias;
+        checks.active.add(rule);
+        try {
+            const existing = this.fs.deductions[rule];
+            if (!existing || existing.from !== this.recipe(d, domain) || existing.steps?.length || existing.conditions.length ||
+                existing.tempvars?.size || existing.induction ||
+                !mgr.equal(existing.conclusion, this.relativeDefinition(d, domain, alias))) {
+                this.fail("缺少经过核验的内部解释，请先对 " + d.rule + " 使用 sat-def");
+            }
+            // The saved symbol category and arity must agree with the actual definition.
+            this.inspectDefinition(rule);
+            if (Number(this.fs.consts.has(alias)) + Number(this.fs.fns.has(alias)) + Number(this.fs.verbs.has(alias)) !== 1) {
+                this.fail("内部解释的符号类别冲突");
+            }
+            return alias;
+        }
+        finally {
+            checks.active.delete(rule);
+            if (root)
+                this.interpretationChecks = undefined;
+        }
+    }
+    /** Validate every persisted interpretation, including ones not yet used by a proof. */
+    validateInterpretations() {
+        for (const [name, definition] of Object.entries(this.fs.deductions)) {
+            if (!definition.from.startsWith("模型解释:"))
+                continue;
+            if (!definition.from.endsWith("*"))
+                this.fail("内部解释缺少完整来源配方");
+            let recipe;
+            try {
+                recipe = JSON.parse(decodeURIComponent(definition.from.slice("模型解释:".length, -1)));
+            }
+            catch {
+                this.fail("内部解释的来源配方无法解析");
+            }
+            if (!Array.isArray(recipe) || recipe.length !== 2 || recipe.some(x => typeof x !== "string"))
+                this.fail("内部解释的来源配方无效");
+            const source = this.inspectDefinition(recipe[0]);
+            const domain = parser.parse(recipe[1], true);
+            const alias = this.interpretation(source, domain);
+            if (this.definitionName(source, domain, alias) !== name)
+                this.fail("内部解释的规则名与来源配方不符");
+        }
     }
     define(source, domain) {
         this.checkDomain(domain);
