@@ -4,7 +4,7 @@ import { Proof } from "./proof.js";
 import { ASTParser } from "./astparser.js";
 import { TR } from "../lang.js";
 import { ConstrainSolver, RuleParser, RuleTree } from "./metarule.js";
-import { containsModelOperation, ModelKind, ModelOperations } from "./model.js";
+import { containsModelOperation, ModelKind, ModelOperations, templateNames } from "./model.js";
 export type ModelUnfoldStep = { path: number[]; target: AST };
 export type DeductionStep = { conditionIdxs: number[], deductionIdx: string, replaceValues: AST[], model?: ModelUnfoldStep }
 export type Deduction = { value: AST, conditions: AST[], conclusion: AST, replaceNames: string[], replaceTypes: { [replvar: string]: boolean }, from: string, steps?: DeductionStep[], tempvars: Set<string> };
@@ -39,6 +39,8 @@ export class FormalSystem {
         this.assert.verbs = this.verbs;
         this.assert.consts = this.consts;
         this.assert.modelDomainCheck = domain => this.model.checkDomain(domain);
+        this.assert.modelTemplateNameCheck = name => this.model.checkTemplateName(name);
+        this.assert.modelPredicateBinding = value => this.model.predicateBinding(value);
         // A safe identity descriptor for display and legacy bookkeeping. Actual
         // model steps are accepted only by deduct's separately checked branch.
         this.addDeduction(".modelunfold", parser.parse("$0⊢$0"), "模型定义展开");
@@ -50,6 +52,13 @@ export class FormalSystem {
     }
     private assertLegacyMetaInput(name: string) {
         if (this.hasModelProof(this.generateDeduction(name))) throw new Error("此元规则尚不能转换含模型展开步骤的宏；请直接应用该宏并重放核验");
+        const seen = new Set<Deduction>();
+        const templates = (d: Deduction): boolean => {
+            if (!d || seen.has(d)) return false;
+            seen.add(d);
+            return templateNames(d.value).size > 0 || !!d.steps?.some(s => s.replaceValues.some(a => templateNames(a).size > 0) || templates(this.deductions[s.deductionIdx]));
+        };
+        if (templates(this.deductions[name])) throw new Error("此元规则尚不能转换未绑定的谓词或列表模板，请先实例化为具体规则");
     }
     private protectModelDefinitions(exclude: string) {
         if (Object.entries(this.deductions).some(([name, d]) => name !== exclude &&
@@ -85,6 +94,8 @@ export class FormalSystem {
         });
         this.assert.getReplVarsType(conclusions.nodes[0], varLists, false);
         astmgr.getVarNames(conclusions, allReplvars, /^\$/);
+        for (const n of templateNames(ast).keys()) { allReplvars.add(n); varLists[n] = true; }
+        for (const n of templateNames(conditions).keys()) matchingReplvars.add(n);
 
         return {
             value: ast,
@@ -795,14 +806,17 @@ export class FormalSystem {
         const errorMsg = TR(`规则 `) + deductionIdx + TR(` 推理失败:`);
         if (!deduction) throw errorMsg + TR("规则不存在");
         const { conditions, conclusion, replaceNames, steps, replaceTypes } = deduction;
+        const templateKinds = templateNames(deduction.value);
 
         // firstly, match condition, get matchtable ( partial initially provided by users)
 
         let replacedVarTypeTable: ReplvarTypeTable = {};
         let matchTable: ReplvarMatchTable = partialTest ? {} : Object.fromEntries(replaceNames.map(
             (replname: string, idx: number) => (
-                this.assert.getReplVarsType(replaceValues[idx], replacedVarTypeTable, replaceTypes[replname]),
-                [replname, astmgr.clone(replaceValues[idx])]
+                templateKinds.has(replname) ? [replname, templateKinds.get(replname) === "predicate" ?
+                    this.model.predicateBinding(replaceValues[idx]) : this.model.argumentBinding(replaceValues[idx])] :
+                (this.assert.getReplVarsType(replaceValues[idx], replacedVarTypeTable, replaceTypes[replname]),
+                [replname, astmgr.clone(replaceValues[idx])])
             )
         ));
         // assertions in pattern
@@ -825,6 +839,7 @@ export class FormalSystem {
             }
         }
         replaceNames.forEach((replname: string, idx: number) => {
+            if (templateKinds.get(replname) === "predicate") return;
             const nast = astmgr.clone(replaceValues[idx]);
             this.assert.expand(nast, replaceTypes[replname]);
             this.assert.match(nast, null, /^\$/, replaceTypes[replname], null, null, astAssertions, assertions)
@@ -840,6 +855,7 @@ export class FormalSystem {
                 astmgr.replace(ass, astAss.nodes[0], astAss);
             }
             for (const [n, v] of Object.entries(matchTable)) {
+                if (v.type === "predicatebinding") continue;
                 astmgr.replace(v, astAss.nodes[0], astAss);
             }
         }
@@ -1713,6 +1729,7 @@ export class FormalSystem {
     }
     metaIffTheorem(idx: string, replaceValues: AST[], name: string, from: string, allowIFFT_RP: boolean) {
         this.assertLegacyMetaInput(idx);
+        if (replaceValues.some(v => templateNames(v).size)) throw new Error("互推替换尚不能处理未绑定谓词或列表模板，请先实例化");
         const d = this.generateDeduction(idx);
         if (!d) throw TR("推理规则不存在");
         if (d.conditions?.length) throw TR("条件推理规则( ⊢ ($$0 <> $$1))匹配失败");

@@ -12,6 +12,13 @@ export const isModelOperation = (a: AST) => a?.type === "fn" &&
     ["#sat", "#abs", "#abst", "#absf"].includes(a.name);
 export const containsModelOperation = (a: AST): boolean => isModelOperation(a) ||
     !!a?.nodes?.some(containsModelOperation);
+export const containsArgumentList = (a: AST): boolean => a?.type === "arglist" || !!a?.nodes?.some(containsArgumentList);
+export function templateNames(a: AST, names = new Map<string, "predicate" | "list">()) {
+    if (a.type === "predtemplate" || a.type === "predref") names.set(a.name, "predicate");
+    if (a.type === "arglist") names.set(a.name, "list");
+    a.nodes?.forEach(n => templateNames(n, names));
+    return names;
+}
 const v = (name: string): AST => ({ type: "replvar", name });
 const sym = (name: string, ...nodes: AST[]): AST => ({ type: "sym", name, nodes });
 const fn = (name: string, ...nodes: AST[]): AST => ({ type: "fn", name, nodes });
@@ -50,6 +57,7 @@ export class ModelOperations {
             if (!this.plainVariable(bound)) this.fail("暂不支持带断言的绑定变量");
             const inner = new Map(replacements); inner.delete(bound.name);
             for (const r of inner.values()) {
+                if (containsArgumentList(r)) this.fail("未绑定参数列表的自由变量不确定，不能穿过绑定变量替换");
                 const free = new Set<string>(); this.fs.assert.getFreeVars(r, free);
                 if (free.has(bound.name)) this.fail("替换可能捕获变量；请先展开并换名");
             }
@@ -103,6 +111,10 @@ export class ModelOperations {
     }
 
     checkDomain(domain: AST): void {
+        if (domain.type === "predref") {
+            if (domain.nodes?.length) this.fail("裸论域模板不能携带参数");
+            this.checkTemplateName(domain.name); return;
+        }
         if (domain.type !== "replvar" || domain.name.startsWith('"')) {
             this.fail("本阶段的论域必须是已用 mprd 定义的一元谓词名；模板和固定参数域尚未开放");
         }
@@ -110,7 +122,35 @@ export class ModelOperations {
         if (definition.kind !== "predicate" || definition.parameters.length !== 1) this.fail("论域谓词必须是一元");
     }
 
-    private guard(domain: AST, term: AST) { return fn(domain.name, mgr.clone(term)); }
+    checkTemplateName(name: string) {
+        if (!/^"[a-z_][a-z0-9_]*$/.test(name)) this.fail("谓词模板名称无效");
+        if (this.fs.consts.has(name) || this.fs.fns.has(name) || this.fs.verbs.has(name)) this.fail("此双引号名称已有旧符号定义，不能同时用作谓词模板");
+    }
+
+    predicateBinding(value: AST): AST {
+        if (value.type !== "replvar") this.fail("谓词参数需要一个已由 mprd 定义的具体谓词名");
+        const d = this.inspectDefinition("dv" + value.name);
+        return { type: "predicatebinding", name: d.name, nodes: [v(String(d.parameters.length))] };
+    }
+
+    argumentBinding(value: AST): AST {
+        if (value.type !== "fn" || !["#args", "("].includes(value.name)) this.fail("参数列表请输入 #args(t1,t2,...)；空列表为 #args()");
+        const types = {};
+        for (const term of value.nodes) {
+            if (containsArgumentList(term)) this.fail("具体参数列表不能再包含未绑定列表");
+            this.fs.assert.checkGrammer(term, "i"); this.fs.assert.getReplVarsType(term, types, true);
+        }
+        return { type: "argbinding", name: "", nodes: value.nodes.map(t => mgr.clone(t)) };
+    }
+    private bindingInput(value: AST): AST {
+        if (value.type === "predicatebinding") return v(value.name);
+        if (value.type === "argbinding") return fn("#args", ...value.nodes.map(t => mgr.clone(t)));
+        return mgr.clone(value);
+    }
+
+    private guard(domain: AST, term: AST): AST {
+        return { type: domain.type === "predref" ? "predtemplate" : "fn", name: domain.name, nodes: [mgr.clone(term)] };
+    }
 
     private alias(source: string, domain: AST): string {
         let hash = 2166136261;
@@ -146,6 +186,7 @@ export class ModelOperations {
     }
 
     private interpretation(d: Definition, domain: AST): string {
+        if (domain.type !== "replvar") this.fail("需要先将论域模板绑定到具体的一元 mprd 谓词");
         const alias = this.alias(d.rule, domain);
         const rule = (d.kind === "predicate" ? "dv" : d.kind === "constant" ? "dc" : "df") + alias;
         const existing = this.fs.deductions[rule];
@@ -158,6 +199,7 @@ export class ModelOperations {
 
     define(source: string, domain: AST): string {
         this.checkDomain(domain);
+        if (domain.type !== "replvar") this.fail("sat-def 需要具体的一元论域谓词，不能为未绑定模板创建定义");
         const d = this.inspectDefinition(source);
         const alias = this.alias(source, domain);
         const name = (d.kind === "predicate" ? "dv" : d.kind === "constant" ? "dc" : "df") + alias;
@@ -210,6 +252,7 @@ export class ModelOperations {
             if (a.name === "#abst") return sym("&", this.guard(domain, body), sym("=", sat(body, domain), mgr.clone(body)));
             // Schematic formula variables have unknown free variables: no guessed guard list.
             const reject = (n: AST) => {
+                if (n.type === "arglist") this.fail("参数列表的自由变量尚未确定，不能展开绝对性");
                 if (n.type === "replvar" && n.name.startsWith("$")) this.fail("公式模板的自由变量尚未确定，不能展开绝对性");
                 if (n.type === "fn" && n.name.startsWith("#") && !isModelOperation(n)) this.fail("请先处理公式内的系统断言");
                 n.nodes?.forEach(reject);
@@ -254,6 +297,7 @@ export class ModelOperations {
             if (d.parameters.length !== body.nodes?.length) this.fail("谓词实参数量不符");
             return fn(this.interpretation(d, domain), ...body.nodes.map(t => this.term(t, domain)));
         }
+        if (body.type === "predtemplate") this.fail("请先把谓词模板及参数列表绑定为具体的 mprd 谓词");
         return this.fail("此公式结构尚无可靠的相对化展开规则");
     }
 
@@ -310,7 +354,7 @@ export class ModelOperations {
                 if (n === d.conditions.length) {
                     if (d.replaceNames.some(x => !table[x])) this.fail("分支仍有无法确定的参数");
                     const index = this.fs.deduct({ deductionIdx: rules[branch], conditionIdxs: selected,
-                        replaceValues: d.replaceNames.map(x => table[x]) });
+                        replaceValues: d.replaceNames.map(x => this.bindingInput(table[x])) });
                     if (!mgr.equal(this.fs.propositions[index].value, goal)) this.fail("归纳分支实际结论与目标不符");
                     return index;
                 }

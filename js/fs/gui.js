@@ -287,7 +287,10 @@ export class FSGui {
             }
             this.addSpan(varnode, ")");
         }
-        else if (ast.type === "fn") {
+        else if (ast.type === "predref" || ast.type === "arglist") {
+            this.addSpan(varnode, ast.name).className = ast.type === "predref" ? "predicate-template" : "argument-list-template";
+        }
+        else if (ast.type === "fn" || ast.type === "predtemplate") {
             if (ast.name === "{") {
                 this.addSpan(varnode, "{");
                 let firstTerm = true;
@@ -308,6 +311,8 @@ export class FSGui {
                 if (!omitNfFn) {
                     if (ast.name !== "(") {
                         const fnName = this.addSpan(varnode, ast.name);
+                        if (ast.type === "predtemplate")
+                            fnName.classList.add("predicate-template");
                         if (ast.name.startsWith("#"))
                             fnName.classList.add("sysfn");
                         if (this.formalSystem.fns.has(ast.name))

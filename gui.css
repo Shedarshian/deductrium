@@ -271,6 +271,8 @@ h1 {
 .model-selectable { outline: 1px dashed currentColor; cursor: pointer; }
 .model-selectable::after { content: "#" attr(data-model-index); font-size: 0.7em; vertical-align: super; }
 .sat-def-shortcut { margin-left: 0.6em; font-size: 0.75em; }
+.predicate-template { color: #b488c6; }
+.argument-list-template { color: #8ba7b7; }
 .cmd-btns button {
     width: 120px;
     height: 40px;

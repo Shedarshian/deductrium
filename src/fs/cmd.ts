@@ -4,11 +4,11 @@ import { ASTParser } from "./astparser.js";
 import { Deduction } from "./formalsystem.js";
 import { FSGui } from "./gui.js";
 import { SavesParser } from "./savesparser.js";
-import { isModelOperation, ModelKind } from "./model.js";
+import { isModelOperation, ModelKind, templateNames } from "./model.js";
 
 export class FSCmd {
     cmdBuffer: any[] = [];
-    astparser = new ASTParser;
+    astparser = new ASTParser(true);
     escClear = true;
     pListMasked = false;
     autoCompleteIdx = -1;
@@ -719,9 +719,13 @@ export class FSCmd {
         } else if (curLength < replVarsLength + condLength + 2) {
             if (curLength > 1) this.escClear = false;
             // wait for replvar input
-            infoWrap.innerHTML = TR("请输入替代") + vars[cmdBuffer.length - 2 - condLength] + TR("的内容");
+            const name = vars[cmdBuffer.length - 2 - condLength];
+            const kind = templateNames(deduction.value).get(name);
+            infoWrap.innerText = kind === "predicate" ? `请输入谓词模板 ${name} 对应的具体 mprd 谓词名` :
+                kind === "list" ? `请输入参数列表 ${name}：#args(t1,t2,...)；空列表 #args()` :
+                TR("请输入替代") + name + TR("的内容");
             if (!this.gui.actionInput.value) {
-                this.gui.actionInput.value = vars[cmdBuffer.length - 2 - condLength];
+                this.gui.actionInput.value = kind === "list" ? "#args()" : kind === "predicate" ? "" : name;
                 // this.gui.actionInput.setSelectionRange(0, this.gui.actionInput.value.length);
 
                 this.gui.actionInput.selectionStart = this._selStart = 0;

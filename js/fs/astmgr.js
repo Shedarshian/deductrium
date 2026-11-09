@@ -81,9 +81,58 @@ export class ASTMgr {
     }
     replaceByMatchTable(ast, matchResult) {
         for (const [varname, matchedAst] of Object.entries(matchResult)) {
+            if (matchedAst.type === "predicatebinding" || matchedAst.type === "argbinding")
+                continue;
             this.replace(ast, { type: "replvar", name: varname }, matchedAst, true);
         }
         this.finishReplace(ast);
+        const instantiate = (a) => {
+            // Values inserted from a caller are traversed once; never recursively
+            // reinterpret a bound predicate name as a new template.
+            if (a.type === "predref") {
+                const binding = matchResult[a.name];
+                if (!binding)
+                    return;
+                if (binding.type !== "predicatebinding" || binding.nodes[0].name !== "1")
+                    throw new Error("论域模板必须绑定一元谓词");
+                this.assign(a, { type: "replvar", name: binding.name });
+                return;
+            }
+            if (a.type === "predtemplate") {
+                const expanded = [];
+                for (const [i, n] of a.nodes.entries()) {
+                    if (n.type === "arglist") {
+                        if (i !== a.nodes.length - 1)
+                            throw new Error("参数列表模板只能位于末尾");
+                        const binding = matchResult[n.name];
+                        if (binding) {
+                            if (binding.type !== "argbinding")
+                                throw new Error("参数列表绑定类别错误");
+                            expanded.push(...binding.nodes.map(v => this.clone(v)));
+                        }
+                        else
+                            expanded.push(this.clone(n));
+                    }
+                    else {
+                        instantiate(n);
+                        expanded.push(n);
+                    }
+                }
+                a.nodes = expanded;
+                const binding = matchResult[a.name];
+                if (binding) {
+                    if (binding.type !== "predicatebinding" || expanded.some(n => n.type === "arglist") || expanded.length !== Number(binding.nodes[0].name))
+                        throw new Error("谓词绑定与实际参数列表的元数不符");
+                    a.type = "fn";
+                    a.name = binding.name;
+                }
+                return;
+            }
+            if (a.type === "arglist")
+                throw new Error("参数列表模板不能出现在普通项或公式位置");
+            a.nodes?.forEach(instantiate);
+        };
+        instantiate(ast);
     }
 }
 //# sourceMappingURL=astmgr.js.map

@@ -13,29 +13,29 @@ export class SavesParser {
     serializeDeductionStep(s) {
         const step = [
             s.deductionIdx, s.conditionIdxs,
-            s.replaceValues.map(v => astparser.stringifyTight(v))
+            s.replaceValues.map(v => astparser.stringifySaved(v))
         ];
         if (s.model)
-            step.push({ path: s.model.path.slice(), target: astparser.stringifyTight(s.model.target) });
+            step.push({ path: s.model.path.slice(), target: astparser.stringifySaved(s.model.target) });
         return step;
     }
     serializeProposition(p) {
-        const value = astparser.stringifyTight(p.value);
+        const value = astparser.stringifySaved(p.value);
         const step = p.from ? this.serializeDeductionStep(p.from) : null;
         return [value, step];
     }
     deserializeDeductionStep(v) {
-        return { conditionIdxs: v[1], deductionIdx: v[0], replaceValues: v[2].map(v => astparser.parse(v)),
-            model: v[3] ? { path: v[3].path.slice(), target: astparser.parse(v[3].target) } : undefined };
+        return { conditionIdxs: v[1], deductionIdx: v[0], replaceValues: v[2].map(v => astparser.parseSaved(v)),
+            model: v[3] ? { path: v[3].path.slice(), target: astparser.parseSaved(v[3].target) } : undefined };
     }
     deserializeProposition(v) {
         return {
-            value: astparser.parse(v[0]),
+            value: astparser.parseSaved(v[0]),
             from: v[1] ? this.deserializeDeductionStep(v[1]) : null
         };
     }
     serializeDeduction(deduction) {
-        const value = astparser.stringifyTight(deduction.value);
+        const value = astparser.stringifySaved(deduction.value);
         const steps = deduction.steps?.map(s => this.serializeDeductionStep(s));
         // if fs has tempvars record, then serialize it
         return deduction.tempvars?.size ? [value, deduction.from, steps, Array.from(deduction.tempvars)] : [value, deduction.from, steps];
@@ -68,7 +68,7 @@ export class SavesParser {
     deserializeDeduction(name, fs, sd) {
         // deserialized data is reliable, no need to regen tempvars
         // fix bugs for nested #nf funcs 26-7-5
-        const val = astparser.parse(sd[0]);
+        const val = astparser.parseSaved(sd[0]);
         try {
             this.assert.expand(val, false);
         }
@@ -113,7 +113,7 @@ export class SavesParser {
             if (v.length)
                 this.deserializeDeduction(k, fs, v);
         }
-        const replay = arrP?.some(v => /#(?:sat|abs|abst|absf)\(/.test(v[0]) || !!v[1]?.[3]) ||
+        const replay = arrP?.some(v => v[0].startsWith("@model-v1:") || /#(?:sat|abs|abst|absf)\(/.test(v[0]) || !!v[1]?.[3] || v[1]?.[2]?.some(s => s.startsWith("@model-v1:"))) ||
             Object.values(fs.deductions).some(d => fs.hasModelProof(d) || d.from.startsWith("模型解释:"));
         if (arrP)
             for (const v of arrP) {
