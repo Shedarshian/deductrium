@@ -1,6 +1,7 @@
 import { AST } from "./astmgr.js"
 import { TR } from "../lang.js";
 export class ASTParser {
+    constructor(private readonly templateSyntax = false) { }
     keywords = ["E!", "⊢M", "<>", "Union", "{}", "Equiv", "<=", ">=", "/|"];
     symChar = "VEMUIX()@~^<>|&=,;:[]!⊢+-*/{}\\";
     ast: AST;
@@ -9,11 +10,11 @@ export class ASTParser {
     token: string;
     stringifyTight(ast: AST, bracket: boolean = false): string {
         const nd = ast.nodes;
-        if (ast.type === "fn") {
+        if (ast.type === "fn" || ast.type === "predtemplate") {
             if (ast.name === "{") return `{${nd.map(n => this.stringifyTight(n)).join(",")}}`;
             return `${ast.name === "(" ? "" : ast.name}(${nd.map(n => this.stringifyTight(n)).join(",")})`;
         }
-        if (ast.type === "replvar" || ast.type === "rule") {
+        if (["replvar", "rule", "predref", "arglist"].includes(ast.type)) {
             return ast.name;
         }
         if (ast.type === "meta") {
@@ -33,11 +34,11 @@ export class ASTParser {
     }
     stringify(ast: AST): string {
         const nd = ast.nodes;
-        if (ast.type === "fn") {
+        if (ast.type === "fn" || ast.type === "predtemplate") {
             if (ast.name === "{") return `{${nd.map(n => this.stringify(n)).join(", ")}}`;
             return `${ast.name === "(" ? "" : ast.name}(${nd.map(n => this.stringify(n)).join(", ")})`;
         }
-        if (ast.type === "replvar" || ast.type === "rule") {
+        if (["replvar", "rule", "predref", "arglist"].includes(ast.type)) {
             return ast.name;
         }
         if (ast.type === "meta") {
@@ -52,7 +53,7 @@ export class ASTParser {
                 return `(${this.stringify(nd[0])} ${ast.name} ${this.stringify(nd[1])})`;
         }
     }
-    parse(s: string) {
+    parse(s: string, strict = false) {
         this.cursor = 0;
         this.tokenise(s.replaceAll("∀", "V").replaceAll("∃", "E").replaceAll("∈", "@").replaceAll("¬", "~")
             .replaceAll("→", ">").replaceAll("↔", "<>").replaceAll("⊂", "<").replaceAll("∪", "U").replaceAll("∩", "I")
@@ -60,7 +61,31 @@ export class ASTParser {
             .replaceAll("ℕ", "N").replaceAll("ℤ", "Z").replaceAll("ℚ", "Q").replaceAll("ℝ", "R").replaceAll("×","*")
         );
         this.nextSym();
-        return this.meta();
+        const ast = this.meta();
+        // Model expressions must never silently accept a parsed prefix.
+        if ((strict || this.templateSyntax || /#(?:sat|abs|abst|absf)\s*\(/.test(s)) && this.token !== undefined) throw new Error("表达式末尾有未解析内容：" + this.token);
+        return ast;
+    }
+    stringifySaved(ast: AST): string {
+        const templates = (a: AST): boolean => ["predtemplate", "predref", "arglist"].includes(a.type) || !!a.nodes?.some(templates);
+        // This prefix cannot begin a valid legacy expression. It versions only
+        // the expression's syntax, not models, signatures or template bindings.
+        return templates(ast) ? "@model-v1:" + JSON.stringify(ast) : this.stringifyTight(ast);
+    }
+    parseSaved(source: string): AST {
+        if (!source.startsWith("@model-v1:")) return new ASTParser(false).parse(source);
+        let budget = 16384;
+        const read = (a: any): AST => {
+            if (--budget < 0 || !a || typeof a.name !== "string" ||
+                !["fn", "sym", "meta", "rule", "replvar", "predtemplate", "predref", "arglist"].includes(a.type) ||
+                (a.nodes !== undefined && !Array.isArray(a.nodes))) throw new Error("模板表达式的存档结构无效");
+            const result: AST = { type: a.type, name: a.name };
+            if (a.nodes) result.nodes = a.nodes.map(read);
+            return result;
+        };
+        // Preserve legacy literal double-quote names even in an expression that
+        // also contains new templates. No predicate definition data is stored.
+        return read(JSON.parse(source.slice(10)));
     }
     private tokenise(s: string) {
         for (let i = 0; i < this.keywords.length; i++) {
@@ -128,19 +153,27 @@ export class ASTParser {
     private itemTerm(): AST {
 
         if (this.acceptVar()) {
+            const word = this.prevToken(1);
+            const predicate = this.templateSyntax && /^"[a-z_][a-z0-9_]*$/.test(word);
+            const list = this.templateSyntax && /^\.\.\.\$[a-z_][a-z0-9_]*$/.test(word);
+            if (this.templateSyntax && word.startsWith("...$") && !list) throw new Error("参数列表名称必须为 ...$ 加小写字母、数字或下划线");
+            if (this.templateSyntax && word.startsWith('"') && !predicate) throw new Error("谓词模板名称必须是双引号前缀加小写字母、数字或下划线");
             if (this.acceptSym("(")) {
                 const fnName = this.prevToken(2);
+                if (list) throw new Error("参数列表模板不能作为函数调用");
+                if (this.acceptSym(")")) return { type: predicate ? "predtemplate" : "fn", name: fnName, nodes: [] };
                 const nodes = [this.meta()];
                 while (this.token === ",") {
                     this.nextSym();
                     nodes.push(this.meta());
                 }
                 this.expectSym(")");
-                return { type: "fn", name: fnName, nodes };
+                return { type: predicate ? "predtemplate" : "fn", name: fnName, nodes };
             } else {
-                return { type: "replvar", name: this.prevToken(1) };
+                return { type: predicate ? "predref" : list ? "arglist" : "replvar", name: word };
             }
         } else if (this.acceptSym("(")) {
+            if (this.acceptSym(")")) return { type: "fn", name: "(", nodes: [] };
             const nodes = [this.meta()];
             while (this.token === ",") {
                 this.nextSym();

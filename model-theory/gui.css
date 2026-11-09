@@ -257,6 +257,22 @@ h1 {
     float: right;
 }
 
+.model-command-buttons {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 0.2em;
+    max-width: 100%;
+}
+.model-sat { background: #F0F8FF; border-radius: 0.2em; }
+.model-abs { background: #FFF4F4; border-radius: 0.2em; }
+.model-sat > .model-bracket, .model-sat > .model-domain { color: #75B9EA; }
+.model-abs > .model-bracket, .model-abs > .model-domain { color: #EC959D; }
+.model-domain { font-size: 0.72em; vertical-align: super; margin-left: 0.1em; }
+.model-selectable { outline: 1px dashed currentColor; cursor: pointer; }
+.model-selectable::after { content: "#" attr(data-model-index); font-size: 0.7em; vertical-align: super; }
+.sat-def-shortcut { margin-left: 0.6em; font-size: 0.75em; }
+.predicate-template { color: #b488c6; }
+.argument-list-template { color: #8ba7b7; }
 .cmd-btns button {
     width: 120px;
     height: 40px;

@@ -5,6 +5,7 @@ import { Deduction, DeductionStep, FormalSystem } from "./formalsystem.js";
 import { TR } from "../lang.js";
 import { ListDragger } from "./itemdragger.js";
 import { RuleTree } from "./metarule.js";
+import { isModelOperation, ModelKind } from "./model.js";
 const astmgr = new ASTMgr();
 
 export class FSGui {
@@ -217,7 +218,31 @@ export class FSGui {
         const varnode = document.createElement("span");
         const astStr = this.cmd.astparser.stringify(ast);
         varnode.setAttribute("ast-string", astStr);
-        if (ast.type === "rule") {
+        if (isModelOperation(ast)) {
+            const sat = ast.name === "#sat";
+            varnode.classList.add(sat ? "model-sat" : "model-abs");
+            this.addSpan(varnode, sat ? "⟦" : "⟨").className = "model-bracket";
+            varnode.appendChild(this.ast2HTML(idx, ast.nodes[0], sat ? isItem : ast.name === "#abst", scopes));
+            this.addSpan(varnode, sat ? "⟧" : "⟩").className = "model-bracket";
+            const domain = document.createElement("sup");
+            domain.className = "model-domain";
+            const domainAst = ast.nodes[1];
+            const fixedArguments = this.formalSystem.model.domainArguments(domainAst);
+            domain.innerText = domainAst.name + (fixedArguments.length ? "[" + fixedArguments.map(p => this.cmd.astparser.stringifyTight(p)).join(",") + "]" : "");
+            varnode.appendChild(domain);
+            const b = this.cmd.cmdBuffer;
+            if (["unfold", "sat-expand", "abs-expand"].includes(b[0]) && b.length === 2 &&
+                idx === "p" + String(b[1]).replace(/^p/, "")) {
+                const kind: ModelKind = b[0] === "sat-expand" ? "sat" : b[0] === "abs-expand" ? "abs" : "all";
+                const source = this.formalSystem.propositions[Number(idx.slice(1))]?.value;
+                const nth = source ? this.formalSystem.model.nodes(source, kind).findIndex(n => n.node === ast) : -1;
+                if (nth >= 0) {
+                    varnode.classList.add("model-selectable");
+                    varnode.dataset.modelIndex = String(nth + 1);
+                    varnode.title = `点击展开第 ${nth + 1} 个模型节点`;
+                }
+            }
+        } else if (ast.type === "rule") {
             this.addSpan(varnode, '"');
             varnode.appendChild(this.tree2HTML(this.formalSystem.getDeductionTokens(ast.name)));
             this.addSpan(varnode, '"');
@@ -245,7 +270,9 @@ export class FSGui {
 
             this.addSpan(varnode, ")");
 
-        } else if (ast.type === "fn") {
+        } else if (ast.type === "predref" || ast.type === "arglist") {
+            this.addSpan(varnode, ast.name).className = ast.type === "predref" ? "predicate-template" : "argument-list-template";
+        } else if (ast.type === "fn" || ast.type === "predtemplate") {
             if (ast.name === "{") {
                 this.addSpan(varnode, "{");
                 let firstTerm = true;
@@ -262,6 +289,7 @@ export class FSGui {
                 if (!omitNfFn) {
                     if (ast.name !== "(") {
                         const fnName = this.addSpan(varnode, ast.name);
+                        if (ast.type === "predtemplate") fnName.classList.add("predicate-template");
                         if (ast.name.startsWith("#")) fnName.classList.add("sysfn");
                         if (this.formalSystem.fns.has(ast.name)) fnName.classList.add("fn");
                         if (this.formalSystem.verbs.has(ast.name)) fnName.classList.add("verb");
@@ -448,7 +476,7 @@ export class FSGui {
             });
             node.addEventListener('click', ev => {
                 ev.stopPropagation();
-                this.cmd.onClickSubAst(idx, varnode.getAttribute("ast-string"));
+                this.cmd.onClickSubAst(idx, varnode.getAttribute("ast-string"), ast);
             });
         }
         return varnode;
@@ -762,6 +790,14 @@ export class FSGui {
                         infoArr.push(itInfo);
                     }
                     setInfo(p, infoArr, itVal, pname);
+
+                    if (/^d[cfv]/.test(pname)) {
+                        const button = document.createElement("button");
+                        button.type = "button"; button.className = "sat-def-shortcut";
+                        button.innerText = "相对化(sat-def)";
+                        button.addEventListener("click", event => { event.stopPropagation(); this.cmd.startSatDefinition(pname); });
+                        itVal.appendChild(button);
+                    }
 
                     itVal.addEventListener("click", () => {
                         const inserted = this.cmd.astparser.stringify(p.value);

@@ -1,5 +1,6 @@
 import { TR } from "../lang.js";
 import { ASTMgr } from "./astmgr.js";
+import { containsArgumentList, containsModelOperation, isModelOperation } from "./model.js";
 const astmgr = new ASTMgr;
 const logicSyms = ["<>", ">", "~", "&", "|"];
 const quantSyms = ["E", "E!", "V"];
@@ -42,6 +43,10 @@ function eq(name1, name2) {
     return F;
 }
 export class AssertionSystem {
+    modelDomainCheck;
+    modelDomainArguments;
+    modelPredicateBinding;
+    modelTemplateNameCheck;
     fns = new Set;
     verbs = new Set;
     consts = new Set;
@@ -188,6 +193,12 @@ export class AssertionSystem {
     }
     // fussy check whether name is nofree in V* ast, exclusions can be provided for replvar name
     nf(name, ast, quants = [], nameIsNot) {
+        if (isModelOperation(ast)) {
+            let result = this.nf(name, ast.nodes[0], quants, nameIsNot);
+            for (const p of this.modelDomainArguments?.(ast.nodes[1]) ?? [])
+                result = and(result, this.nf(name, p, quants, nameIsNot));
+            return result;
+        }
         const astName = this.getVarName(ast);
         // ast is var
         if (ast.type === "replvar") {
@@ -324,6 +335,21 @@ export class AssertionSystem {
     }
     // return a ReplvarTypeTable (or add to a existed one, throw error when conflits) for ast
     getReplVarsType(ast, res = {}, isItem, resfn = {}) {
+        if (ast.type === "predtemplate") {
+            this.checkGrammer(ast, isItem ? "i" : "p");
+            for (const n of ast.nodes)
+                if (n.type !== "arglist")
+                    this.getReplVarsType(n, res, true, resfn);
+            return res;
+        }
+        if (isModelOperation(ast)) {
+            this.checkGrammer(ast, isItem ? "i" : "p");
+            this.getReplVarsType(ast.nodes[0], res, this.getSubAstType(ast, 0, isItem), resfn);
+            for (const p of this.modelDomainArguments?.(ast.nodes[1]) ?? [])
+                if (p.type !== "arglist")
+                    this.getReplVarsType(p, res, true, resfn);
+            return res;
+        }
         if (ast.type === "replvar") {
             res[ast.name] ??= isItem;
             if (res[ast.name] !== isItem)
@@ -343,6 +369,10 @@ export class AssertionSystem {
     }
     // return ast's type (item for true, boolean for false)
     getAstType(ast, varLists) {
+        if (ast.type === "predtemplate")
+            return false;
+        if (isModelOperation(ast))
+            return ast.name === "#sat" ? this.getAstType(ast.nodes[0], varLists) : false;
         if (ast.type === "replvar") {
             const v = varLists[ast.name];
             if (v === true)
@@ -356,12 +386,18 @@ export class AssertionSystem {
                 return false;
             if (quantSyms.includes(ast.name))
                 return false;
+            if (verbSyms.includes(ast.name))
+                return false;
             if (ast.name === "{|" || ast.name === "|}")
                 return true;
             return true;
         }
         if (ast.type === "fn") {
             if (ast.name === "{" || ast.name === "(")
+                return true;
+            if (this.verbs.has(ast.name))
+                return false;
+            if (this.fns.has(ast.name))
                 return true;
             if (ast.name.match(/^#v*nf/) || ast.name.match(/^#c?rp/)) {
                 return this.getAstType(ast.nodes[0], varLists);
@@ -433,6 +469,18 @@ export class AssertionSystem {
         }
     }
     getFreeVars(ast, res, scope = new Set) {
+        if (ast.type === "predref")
+            return;
+        if (ast.type === "arglist") {
+            res.add(ast.name);
+            return;
+        }
+        if (isModelOperation(ast)) {
+            this.getFreeVars(ast.nodes[0], res, new Set(scope));
+            for (const p of this.modelDomainArguments?.(ast.nodes[1]) ?? [])
+                this.getFreeVars(p, res, new Set(scope));
+            return;
+        }
         const varname = this.getVarName(ast);
         if (varname) {
             if (!scope.has(varname))
@@ -462,6 +510,12 @@ export class AssertionSystem {
             }
     }
     getVarNamesAndIsNots(ast, res, reg, scope = new Set) {
+        if (isModelOperation(ast)) {
+            this.getVarNamesAndIsNots(ast.nodes[0], res, reg, new Set(scope));
+            for (const p of this.modelDomainArguments?.(ast.nodes[1]) ?? [])
+                this.getVarNamesAndIsNots(p, res, reg, new Set(scope));
+            return res;
+        }
         const varname = this.getVarName(ast);
         if (varname) {
             if (!varname.match(reg))
@@ -496,6 +550,8 @@ export class AssertionSystem {
     // fussy search if subast exist in ast
     // return  matched positions's scopes, false if unknown
     getSubAstMatchTimes(ast, subAst, nth, dst, scope = [], res = [], right) {
+        if (scope.length && containsArgumentList(subAst))
+            return false;
         if (scope.length) {
             const vars = this.getVarNamesAndIsNots(subAst, {}, null);
             for (const [v, vIsNot] of Object.entries(vars)) {
@@ -513,6 +569,8 @@ export class AssertionSystem {
             res.push(scope);
             return res;
         } // matched whole ast one time
+        if (isModelOperation(ast))
+            return false;
         if (eq === U) {
             if (nth === -1 && (this.astEq(ast, dst)))
                 return res;
@@ -575,6 +633,8 @@ export class AssertionSystem {
         return res;
     }
     getSubAstMatchTimesAndReplace(ast, subAst, newAst, nth, scope = [], res = [], right) {
+        if (scope.length && containsArgumentList(subAst))
+            return false;
         if (nth !== -1 && nth < res.length)
             return res; // completed, this short circuit is neccesary for later unknown $s 
         if (scope.length) {
@@ -606,6 +666,8 @@ export class AssertionSystem {
             res.push(scope);
             return res;
         } // matched whole ast one time
+        if (isModelOperation(ast))
+            throw new Error("不能在不透明模型操作内部执行普通替换；请先展开模型节点");
         if (eq === U) {
             // if (nth === -1 && this.astEq(ast, newAst)) return res;
             return false; // unknown
@@ -701,6 +763,10 @@ export class AssertionSystem {
     // only according to ast's structure, give its nth child's type
     // this is a helper fn for recursively check sub nodes
     getSubAstType(ast, idx, parentType) {
+        if (ast.type === "predtemplate")
+            return true;
+        if (isModelOperation(ast))
+            return idx === 0 ? (ast.name === "#sat" ? parentType : ast.name === "#abst") : true;
         if (ast.type === "meta")
             return false;
         if (ast.type === "sym") {
@@ -728,6 +794,8 @@ export class AssertionSystem {
     }
     // remove all assert fns without checkments
     unwrapAssertions(ast) {
+        if (isModelOperation(ast))
+            return;
         if (ast.type === "replvar")
             return;
         // we don't remove #rp, this can cause #rp in condition can't be matched
@@ -743,6 +811,18 @@ export class AssertionSystem {
     }
     // reduce and expand assertions in ast
     expand(ast, isItem, varLists) {
+        if (ast.type === "fn" && ["#rp", "#crp"].includes(ast.name) && containsArgumentList(ast) &&
+            !astmgr.equal(ast.nodes[1], ast.nodes[2]))
+            throw new Error("未绑定参数列表可能包含任意自由变量，不能直接执行替换");
+        if (ast.type === "fn" && ["#rp", "#crp"].includes(ast.name) && containsModelOperation(ast.nodes?.[0]) &&
+            !astmgr.equal(ast.nodes[0], ast.nodes[1]) && !astmgr.equal(ast.nodes[1], ast.nodes[2])) {
+            throw new Error("普通替换不能穿透不透明模型操作，请先显式展开");
+        }
+        if (isModelOperation(ast)) {
+            this.checkGrammer(ast, isItem ? "i" : "p");
+            this.getReplVarsType(ast, varLists ?? {}, isItem);
+            return;
+        }
         // astmgr.assign(ast,astmgr.clone(ast)); // avoid inner inter refering
         varLists ??= this.getReplVarsType(ast, {}, isItem);
         // first, check all subnodes are consist and expand them
@@ -1049,6 +1129,63 @@ export class AssertionSystem {
             patternAssertions.push(astmgr.clone(pattern));
             return;
         }
+        if (pattern?.type === "predref") {
+            const binding = this.modelPredicateBinding?.(ast);
+            if (!binding || (!binding.name.startsWith('"') && binding.nodes[0].name !== "1"))
+                throw new Error("论域模板只能匹配一元 mprd 谓词或抽象论域引用");
+            if (result[pattern.name] && !astmgr.equal(result[pattern.name], binding))
+                throw new Error("同一谓词模板的绑定不一致");
+            result[pattern.name] = binding;
+            return;
+        }
+        if (pattern?.type === "predtemplate") {
+            if (ast.type === "predtemplate") {
+                if (ast.nodes.length !== pattern.nodes.length)
+                    throw new Error("抽象谓词模板的列表结构必须一致");
+                const binding = this.modelPredicateBinding({ type: "predref", name: ast.name });
+                if (result[pattern.name] && !astmgr.equal(result[pattern.name], binding))
+                    throw new Error("抽象谓词模板绑定不一致");
+                result[pattern.name] = binding;
+                for (let i = 0; i < ast.nodes.length; i++) {
+                    if (ast.nodes[i].type === "arglist" || pattern.nodes[i].type === "arglist") {
+                        if (ast.nodes[i].type !== "arglist" || pattern.nodes[i].type !== "arglist")
+                            throw new Error("抽象参数列表不一致");
+                        const value = { type: "argbinding", name: "", nodes: [astmgr.clone(ast.nodes[i])] };
+                        const key = pattern.nodes[i].name;
+                        if (result[key] && !astmgr.equal(result[key], value))
+                            throw new Error("抽象参数列表绑定不一致");
+                        result[key] = value;
+                    }
+                    else
+                        this.match(ast.nodes[i], pattern.nodes[i], replNameReg, true, result, varTable, astAssertions, patternAssertions);
+                }
+                return;
+            }
+            if (ast.type !== "fn")
+                throw new Error("谓词模板只能匹配 mprd 谓词调用");
+            const binding = this.modelPredicateBinding?.({ type: "replvar", name: ast.name });
+            if (!binding || Number(binding.nodes[0].name) !== ast.nodes?.length)
+                throw new Error("具体谓词的元数与定义不符");
+            if (result[pattern.name] && !astmgr.equal(result[pattern.name], binding))
+                throw new Error("同一谓词模板的符号或元数不一致");
+            result[pattern.name] = binding;
+            const last = pattern.nodes[pattern.nodes.length - 1];
+            const tail = last?.type === "arglist";
+            const count = pattern.nodes.length - (tail ? 1 : 0);
+            if (tail ? ast.nodes.length < count : ast.nodes.length !== count)
+                throw new Error("谓词模板的参数个数不匹配");
+            for (let i = 0; i < count; i++)
+                this.match(ast.nodes[i], pattern.nodes[i], replNameReg, true, result, varTable, astAssertions, patternAssertions);
+            if (tail) {
+                const value = { type: "argbinding", name: "", nodes: ast.nodes.slice(count).map(n => astmgr.clone(n)) };
+                if (result[last.name] && !astmgr.equal(result[last.name], value))
+                    throw new Error("同一参数列表模板绑定了不同的有序列表");
+                for (const term of value.nodes)
+                    this.getReplVarsType(term, varTable, true);
+                result[last.name] = value;
+            }
+            return;
+        }
         if (pattern && (ast.type !== pattern?.type || ast.name !== pattern?.name)) {
             if ((!!this.getRpParams(pattern)) !== (!!this.getRpParams(ast))) {
                 throw TR(`替换函数#rp导致模式匹配`) + TR(`时无法顺利进行`) + `: \n` + (parser.stringify(pattern)) + " <=?=> " + (parser.stringify(ast));
@@ -1088,7 +1225,7 @@ export class AssertionSystem {
             }
         }
         catch (e) { /** if can't match, just ignore it **/ }
-        if (!ast.nodes?.length)
+        if (isModelOperation(ast) || !ast.nodes?.length)
             return result;
         for (let i = 0; i < ast.nodes.length; i++) {
             if ("E!V".includes(ast.name) && i === 0)
@@ -1103,6 +1240,52 @@ export class AssertionSystem {
     // v: variable
     // i: item
     checkGrammer(ast, type) {
+        if (ast.type === "fn" && ast.name === "#args")
+            throw new Error("#args 只用于输入参数列表，不能作为数学项或公式");
+        if (ast.type === "predtemplate") {
+            if (type !== "p")
+                throw new Error("谓词模板调用只能出现在公式位置");
+            if (!Array.isArray(ast.nodes))
+                throw new Error("谓词模板缺少参数列表");
+            if (!this.modelTemplateNameCheck)
+                throw new Error("当前上下文不能核验谓词模板");
+            this.modelTemplateNameCheck(ast.name);
+            for (const [i, n] of ast.nodes.entries()) {
+                if (n.type === "arglist") {
+                    if (i !== ast.nodes.length - 1 || n.nodes?.length || !/^\.\.\.\$[a-z_][a-z0-9_]*$/.test(n.name))
+                        throw new Error("参数列表模板只能在谓词调用末尾出现一次");
+                }
+                else
+                    this.checkGrammer(n, "i");
+            }
+            return;
+        }
+        if (ast.type === "predref" || ast.type === "arglist")
+            throw new Error("谓词引用或参数列表不能作为普通项、公式或绑定变量");
+        if (isModelOperation(ast)) {
+            if (type !== "p" && type !== "i")
+                throw new Error("模型操作不能放在变量或规则名称位置");
+            if (ast.nodes?.length !== 2)
+                throw new Error("#sat/#abs 必须恰好有两个参数");
+            if (!this.modelDomainCheck)
+                throw new Error("当前上下文不能核验模型论域");
+            this.modelDomainCheck(ast.nodes[1]);
+            if (ast.name === "#abs") {
+                const body = ast.nodes[0];
+                if (body.type === "sym")
+                    ast.name = logicSyms.includes(body.name) || quantSyms.includes(body.name) || verbSyms.includes(body.name) ? "#absf" : "#abst";
+                else if (body.type === "fn" && this.verbs.has(body.name))
+                    ast.name = "#absf";
+                else if ((body.type === "replvar" && this.isConst(body.name)) || (body.type === "fn" && (this.fns.has(body.name) || body.name === "{")))
+                    ast.name = "#abst";
+                else
+                    throw new Error("绝对性类别不明确，请使用 #abst(项,D) 或 #absf(公式,D)");
+            }
+            if (ast.name !== "#sat" && type !== "p")
+                throw new Error("#abs 的结果必须是公式");
+            this.checkGrammer(ast.nodes[0], ast.name === "#sat" ? type : ast.name === "#abst" ? "i" : "p");
+            return;
+        }
         if (type === "v") {
             if (!this.getVarName(ast))
                 throw TR(`表达式出现在了变量的位置中`);
@@ -1180,7 +1363,7 @@ export class AssertionSystem {
             }
             else if (quantSyms.includes(ast.name)) {
                 if (type !== "p")
-                    return TR("意外出现了量词") + ast.name;
+                    throw TR("意外出现了量词") + ast.name;
                 const varName = this.getVarName(ast.nodes[0]);
                 if (!varName)
                     throw TR(`非变量表达式出现在了量词`) + ast.name + TR(`的约束变量中`);

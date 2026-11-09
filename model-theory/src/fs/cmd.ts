@@ -4,10 +4,11 @@ import { ASTParser } from "./astparser.js";
 import { Deduction } from "./formalsystem.js";
 import { FSGui } from "./gui.js";
 import { SavesParser } from "./savesparser.js";
+import { isModelOperation, ModelKind, templateNames } from "./model.js";
 
 export class FSCmd {
     cmdBuffer: any[] = [];
-    astparser = new ASTParser;
+    astparser = new ASTParser(true);
     escClear = true;
     pListMasked = false;
     autoCompleteIdx = -1;
@@ -201,6 +202,7 @@ export class FSCmd {
 
     }
     clearCmdBuffer() {
+        document.querySelectorAll(".model-selectable").forEach(e => e.classList.remove("model-selectable"));
         if (this.pListMasked) { this.gui.clearPListMasked(); this.pListMasked = false; }
         if (this.escClear) {
             this.cmdBuffer = [];
@@ -223,7 +225,16 @@ export class FSCmd {
             e.disabled = true;
         });
         try {
+            if (typeof cmdBuffer[0] === "string" && /^(unfold|sat-expand|abs-expand|sat-def)\s/.test(cmdBuffer[0])) {
+                const input = cmdBuffer.shift() as string;
+                const match = input.match(/^(\S+)\s+(\S+)(?:\s+([\s\S]+))?$/);
+                cmdBuffer.unshift(match[1], match[2]);
+                if (match[3]) cmdBuffer.push(match[3]);
+            }
             switch (cmdBuffer[0]) {
+                case "unfold": case "sat-expand": case "abs-expand": return this.execModelExpand();
+                case "sat-def": return this.execSatDefinition();
+                case "mfinduct": case "mfinduct-full": return this.execModelInduction();
                 case "copy": {
                     hintText.innerText = TR("可复制定理内容，按Esc取消");
                     if (cmdBuffer.length > 1) {
@@ -283,6 +294,72 @@ export class FSCmd {
             this.clearCmdBuffer();
             hintText.innerText = TR(`意外的错误：`) + e;
         }
+    }
+    private modelKind(): ModelKind {
+        return this.cmdBuffer[0] === "sat-expand" ? "sat" : this.cmdBuffer[0] === "abs-expand" ? "abs" : "all";
+    }
+    private modelProposition(text: string): number {
+        if (!/^p?[0-9]+$/.test(String(text))) throw new Error("请输入 p0 形式的定理编号");
+        const index = Number(String(text).replace(/^p/, ""));
+        if (!this.gui.formalSystem.propositions[index]) throw new Error("此定理不存在");
+        return index;
+    }
+    private execModelExpand() {
+        const b = this.cmdBuffer;
+        if (b.length === 1) { this.gui.hintText.innerText = "请选择要展开的定理，或输入 p0 形式的编号"; return; }
+        const source = this.modelProposition(b[1]);
+        if (b.length === 2) {
+            const nodes = this.gui.formalSystem.model.nodes(this.gui.formalSystem.propositions[source].value, this.modelKind());
+            if (!nodes.length) throw new Error("此定理没有可选的模型节点");
+            this.gui.hintText.innerText = `点击要展开的模型括号/上标，或输入节点序号（1–${nodes.length}）；Esc 取消`;
+            this.gui.updatePropositionList(true);
+            return;
+        }
+        if (b.length !== 3 || !/^[1-9][0-9]*$/.test(b[2])) throw new Error("节点序号必须是从 1 开始的整数");
+        const result = this.gui.formalSystem.unfoldModel(source, Number(b[2]), this.modelKind());
+        this.clearCmdBuffer(); this.gui.updatePropositionList(true);
+        this.gui.hintText.innerText = `已生成 p${result}，源定理保留`;
+    }
+    private execSatDefinition() {
+        const b = this.cmdBuffer;
+        if (b.length === 1) { this.gui.hintText.innerText = "请选择 df/dv/dc 定义规则，或输入其名称"; return; }
+        this.gui.formalSystem.model.inspectDefinition(b[1]);
+        if (b.length === 2) { this.gui.hintText.innerText = "请输入具体的 mprd 论域：一元谓词名，或 p(_,a,b) 形式的固定参数域"; return; }
+        if (b.length !== 3) throw new Error("sat-def 参数数量错误");
+        const rule = this.gui.formalSystem.model.define(b[1], this.astparser.parse(b[2], true));
+        if (!this.gui.deductions.includes(rule)) this.gui.addToDeductions(rule);
+        this.clearCmdBuffer(); this.gui.updateDeductionList();
+        this.gui.hintText.innerText = `已生成或复用内部定义 ${rule}；存在前提完整保留`;
+    }
+    private execModelInduction() {
+        const b = this.cmdBuffer;
+        const commonAt = b[0] === "mfinduct-full" ? 12 : 8;
+        const prompts = ["", "请输入性质公式模板，用 #slot 表示公式槽", "请输入具体目标公式；或输入 $A 形式的公式参数以创建可复用的结构归纳规则",
+            "请选择属于原子分支的规则", "请选择相等原子分支的规则", "请选择否定构造分支的规则",
+            "请选择蕴含构造分支的规则", "请选择全称构造分支的规则",
+            ...(commonAt === 12 ? ["请选择合取构造分支的规则", "请选择析取构造分支的规则", "请选择互推构造分支的规则", "请选择存在构造分支的规则"] : []),
+            "请输入共同前提定理编号，以逗号分隔；无前提输入 -"];
+        if (b.length <= commonAt) { this.gui.hintText.innerText = prompts[b.length]; return; }
+        if (b.length > commonAt + 1 && !/^\$[a-zA-Z0-9_]+$/.test(b[2])) throw new Error("结构递归参数数量错误");
+        const common = b[commonAt].trim() === "-" ? [] : b[commonAt].split(",").map(x => this.modelProposition(x.trim()));
+        const template = this.astparser.parse(b[1], true);
+        const target = this.astparser.parse(b[2], true);
+        if (target.type === "replvar" && /^\$[a-zA-Z0-9_]+$/.test(target.name)) {
+            if (!this.getInputNewDeductionPos(commonAt + 1)) return;
+            const rule = this.gui.formalSystem.model.createInduction(b[commonAt + 3], template, target.name, b.slice(3, commonAt), common.map(i => this.gui.formalSystem.propositions[i].value));
+            this.gui.addToDeductions(rule, b[commonAt + 1]);
+            this.clearCmdBuffer(); this.gui.updateDeductionList();
+            this.gui.hintText.innerText = "已生成结构归纳规则 " + rule + "；每次应用都会重新核验实际证明及量词侧条件";
+            return;
+        }
+        const result = this.gui.formalSystem.model.induct(template, target, b.slice(3, commonAt), common);
+        this.clearCmdBuffer(); this.gui.updatePropositionList(true);
+        this.gui.hintText.innerText = `已逐分支组合出 p${result}；这是具体公式的证明，不代表已证明任意公式模式`;
+    }
+    startSatDefinition(name: string) {
+        if (this.cmdBuffer.length === 1 && this.cmdBuffer[0] === "sat-def") { this.cmdBuffer.push(name); this.execCmdBuffer(); return; }
+        if (this.cmdBuffer.length) { this.gui.hintText.innerText = "请先完成当前行动，或按 Esc 取消"; return; }
+        this.cmdBuffer.push("sat-def", name); this.execCmdBuffer();
     }
     execExpand() {
         const hintText = this.gui.hintText;
@@ -544,6 +621,7 @@ export class FSCmd {
                     afterName = cmdBuffer[4];
                     break;
                 default:
+                    if (formalSystem.metaMacro[cmdBuffer[1]]) { newName = formalSystem.applyMetaMacro(cmdBuffer[1], cmdBuffer.slice(2)); break; }
                     throw TR("很抱歉，该规则暂未被作者实现");
             }
             // if (!formalSystem.deductions[newName].from.endsWith("*")) formalSystem.deductions[newName].from += "*";
@@ -655,9 +733,13 @@ export class FSCmd {
         } else if (curLength < replVarsLength + condLength + 2) {
             if (curLength > 1) this.escClear = false;
             // wait for replvar input
-            infoWrap.innerHTML = TR("请输入替代") + vars[cmdBuffer.length - 2 - condLength] + TR("的内容");
+            const name = vars[cmdBuffer.length - 2 - condLength];
+            const kind = templateNames(deduction.value).get(name);
+            infoWrap.innerText = kind === "predicate" ? `请输入谓词模板 ${name} 对应的具体 mprd 谓词名` :
+                kind === "list" ? `请输入参数列表 ${name}：#args(t1,t2,...)；空列表 #args()` :
+                TR("请输入替代") + name + TR("的内容");
             if (!this.gui.actionInput.value) {
-                this.gui.actionInput.value = vars[cmdBuffer.length - 2 - condLength];
+                this.gui.actionInput.value = kind === "list" ? "#args()" : kind === "predicate" ? "" : name;
                 // this.gui.actionInput.setSelectionRange(0, this.gui.actionInput.value.length);
 
                 this.gui.actionInput.selectionStart = this._selStart = 0;
@@ -905,9 +987,33 @@ export class FSCmd {
         }
         hintText.innerText = TR(`请输入假设命题p`) + (hypCount === -1 ? formalSystem.propositions.length : hypCount) + TR(`，或按“Esc”结束`);
     }
-    onClickSubAst(idx: string, inserted: string) {
+    onClickSubAst(idx: string, inserted: string, selectedAst?: AST) {
         if (idx === "-") return;
         const cmdBuffer = this.cmdBuffer;
+        if (["unfold", "sat-expand", "abs-expand"].includes(cmdBuffer[0])) {
+            if (cmdBuffer.length === 1) {
+                if (!/^p[0-9]+$/.test(idx)) { this.gui.hintText.innerText = "请选择源定理"; return; }
+                cmdBuffer.push(idx); this.execCmdBuffer(); return;
+            }
+            const source = this.modelProposition(cmdBuffer[1]);
+            if (idx !== "p" + source || !selectedAst || !isModelOperation(selectedAst)) { this.gui.hintText.innerText = "请点击已选定理中要展开的模型括号或上标"; return; }
+            const nodes = this.gui.formalSystem.model.nodes(this.gui.formalSystem.propositions[source].value, this.modelKind());
+            const nth = nodes.findIndex(n => n.node === selectedAst);
+            if (nth < 0) { this.gui.hintText.innerText = "该节点不属于当前筛选类型"; return; }
+            cmdBuffer.push(String(nth + 1)); this.execCmdBuffer(); return;
+        }
+        if (cmdBuffer[0] === "sat-def") {
+            if (cmdBuffer.length === 1 && this.gui.formalSystem.deductions[idx]) { cmdBuffer.push(idx); this.execCmdBuffer(); }
+            else this.replaceActionInputFromClick(inserted);
+            return;
+        }
+        if (cmdBuffer[0] === "mfinduct" || cmdBuffer[0] === "mfinduct-full") {
+            const commonAt = cmdBuffer[0] === "mfinduct-full" ? 12 : 8;
+            if (cmdBuffer.length === commonAt + 1 && /^\$[a-zA-Z0-9_]+$/.test(cmdBuffer[2]) && this.gui.formalSystem.deductions[idx]) { cmdBuffer.push(idx); this.execCmdBuffer(); return; }
+            if (cmdBuffer.length >= 3 && cmdBuffer.length < commonAt && this.gui.formalSystem.deductions[idx]) { cmdBuffer.push(idx); this.execCmdBuffer(); }
+            else this.replaceActionInputFromClick(inserted);
+            return;
+        }
         // click prop just for copy
         if (idx.startsWith("p") && !cmdBuffer.length || cmdBuffer[0] === "copy") {
             cmdBuffer.push("copy");
