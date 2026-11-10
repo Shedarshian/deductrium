@@ -199,6 +199,70 @@ test('all unary meta-rule signature queries leave their input proof body untouch
     }
 });
 
+test('one-level composite quantification/discharge uses the base DAG without compiling intermediate proofs', () => {
+    const fs = system();
+    saves.deserializeDeduction('lemma', fs, ['$1,$2,$3,$4⊢$0>$0', 'user*', [['.i', [], ['$0']]]]);
+    const name = 'vvvv>>>>lemma';
+    const target = fs.generateDeduction(name);
+    for (const intermediate of ['>lemma', '>>lemma', '>>>lemma', '>>>>lemma', 'v>>>>lemma', 'vv>>>>lemma', 'vvv>>>>lemma']) {
+        const rule = fs.generateDeduction(intermediate);
+        rule.proof.load = () => { throw new Error('compiled intermediate proof: ' + intermediate); };
+    }
+    const version = fs.environmentVersion;
+    const steps = fs.getProofSteps(target);
+    assert.equal(fs.environmentVersion, version, 'materializing a derived proof must not invalidate checked metadata');
+    assert.equal(steps.length, 5, 'four projections plus the original single source step');
+    assert.ok(steps.every(step => step.deductionIdx.startsWith('vvvv')));
+    const deep = fs.isMacro(fs.deductions['.i']) && fs.deductions['.i'].proof;
+    const originalLoad = deep.load;
+    deep.load = () => { throw new Error('expanded descendant body'); };
+    fs.expandMacroWithDefaultValue(name);
+    deep.load = originalLoad;
+    assert.equal(str(fs.propositions.at(-1).value), str(target.conclusion));
+});
+
+test('fused discharge preserves remaining assumptions and validates its atomic expansion', () => {
+    const fs = system();
+    for (const name of ['vv>.t', '>>.t', 'vv>>.t']) {
+        const rule = fs.generateDeduction(name);
+        fs.expandMacroWithDefaultValue(name);
+        assert.equal(str(fs.propositions.at(-1).value), str(rule.conclusion), name);
+        assert.equal(fs.propositions.filter(p => !p.from).length, rule.conditions.length, name);
+        fs.expandMacroWithDefaultValue(name, 'deep');
+        assert.equal(str(fs.propositions.at(-1).value), str(rule.conclusion), name + ' deep');
+    }
+});
+
+test('top-level one-layer output does not consume the cumulative deep-expansion budget', () => {
+    const fs = system();
+    saves.deserializeDeduction('wide', fs, ['⊢$0>$0', 'user*', Array.from({ length: 2000 }, () => ['.i', [], ['$0']])]);
+    fs.evaluationLimits.operations = 200;
+    fs.expandMacroWithDefaultValue('wide');
+    assert.equal(fs.propositions.length, 2000);
+    assert.ok(fs.propositions.every(p => p.from.deductionIdx === '.i'));
+    const before = JSON.stringify(fs.propositions);
+    assert.throws(() => fs.expandMacroWithDefaultValue('wide', 'deep'), /budget/);
+    assert.equal(JSON.stringify(fs.propositions), before);
+    fs.removePropositions();
+    fs.deduct({ deductionIdx: 'wide', conditionIdxs: [], replaceValues: [parser.parse('A')] }, () => 'inline');
+    assert.equal(fs.propositions.length, 2000);
+});
+
+test('building a wide fused current layer also uses per-item accounting while deep traversal stays bounded', async () => {
+    const fs = system();
+    saves.deserializeDeduction('wide', fs, ['$1,$2,$3,$4⊢$0>$0', 'user*', Array.from({ length: 2000 }, () => ['.i', [], ['$0']])]);
+    fs.evaluationLimits.operations = 1000;
+    const name = 'vvvv>>>>wide';
+    await fs.prepareExpansion(name);
+    const rule = fs.generateDeduction(name);
+    fs.expandMacroWithDefaultValue(name);
+    assert.equal(fs.propositions.length, 2004);
+    assert.equal(str(fs.propositions.at(-1).value), str(rule.conclusion));
+    const before = JSON.stringify(fs.propositions);
+    assert.throws(() => fs.expandMacroWithDefaultValue(name, 'deep'), /budget/);
+    assert.equal(JSON.stringify(fs.propositions), before);
+});
+
 test('the existing save format round-trips lazy user macros and propositions', () => {
     const fs = system();
     const name = chain(fs, 30);
