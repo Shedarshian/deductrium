@@ -103,24 +103,58 @@ export class FormalSystem {
         this.deductions[name].liftable = liftable;
         return name;
     }
-    /** c/v are admissible for checked macros in this Hilbert calculus. Keep
-     * the existing proof transformer as the explicit, one-level proof recipe.
-     * Unknown conditional primitives still take its original checked path. */
-    private deferLift(op: "c" | "v", input: string, from: string, build: () => string): string {
+    /** Derive a signature without materializing any referenced proof body.
+     * The original transformer remains the explicit, one-level proof recipe. */
+    private deferTransform(op: "c" | "v" | ">" | "<" | "u" | "e", input: string, from: string, build: () => string): string {
+        // Preserve the existing inverse cancellations and atomic-rule checks.
+        if ((op === ">" && input[0] === "<") || (op === "<" && input[0] === ">")) return build();
         const name = op + input;
         if (this.deductions[name]) return name;
         const d = this.generateDeduction(input);
-        if (!d || (op === "v" && !this.isMacro(d)) || !this.canLift(d)) return build();
+        if (!d) return build();
+        if (op === ">" && (!d.conditions.length || input === "mp")) return build();
+        if (op === "<" && (d.conclusion.type !== "sym" || d.conclusion.name !== ">")) return build();
+        if (op === "e" && d.conditions.length !== 1) return build();
+        if (op === "u" && !d.conditions.length) return build();
+        if (["v", ">", "u"].includes(op) && !this.isMacro(d)) return build();
+        if (!this.canLift(d)) return build();
         const variable = this._findNewReplName(input);
-        const wrap = (ast: AST): AST => ({ type: "sym", name: op === "c" ? ">" : "V", nodes: [astmgr.clone(variable), astmgr.clone(ast)] });
+        const wrap = (symbol: string, ast: AST): AST => ({ type: "sym", name: symbol, nodes: [astmgr.clone(variable), astmgr.clone(ast)] });
         // addHypothese/expand retain the assertion normalization used by the
         // proof transformer, without visiting any of the input's subproofs.
         const oldP = this.propositions;
         let conditions: AST[];
-        const conclusion = wrap(d.conclusion);
+        let rawConditions = d.conditions;
+        let conclusion: AST;
         try {
             this.propositions = [];
-            d.conditions.forEach(c => this.addHypothese(wrap(c)));
+            if (op === "c" || op === "v" || op === "e") {
+                const symbol = op === "c" ? ">" : op === "e" ? "E" : "V";
+                rawConditions = d.conditions.map(c => wrap(symbol, c));
+                conclusion = wrap(symbol, d.conclusion);
+            } else if (op === ">") {
+                rawConditions = d.conditions.slice(0, -1);
+                conclusion = { type: "sym", name: ">", nodes: [astmgr.clone(d.conditions[d.conditions.length - 1]), astmgr.clone(d.conclusion)] };
+            } else if (op === "<") {
+                rawConditions = [...d.conditions, d.conclusion.nodes[0]];
+                conclusion = astmgr.clone(d.conclusion.nodes[1]);
+            } else {
+                // Use the same hypothesis normalization and match table as
+                // the original generalization transformer. Re-applying d to
+                // the wrapped hypotheses would impose different constraints.
+                const replacements: ReplvarMatchTable = {};
+                for (const c of d.conditions) {
+                    if (assert.nf(variable.name, c) === -1) throw TR("元推理结论规则中的条件中的#nf函数永远无法通过验证");
+                    this.addHypothese({ type: "fn", name: "#nf", nodes: [astmgr.clone(c), astmgr.clone(variable)] });
+                    assert.match(this.propositions[this.propositions.length - 1].value, c, /^\$/, false, replacements, {}, null, []);
+                }
+                rawConditions = this.propositions.map(p => p.value);
+                const body = astmgr.clone(d.conclusion);
+                astmgr.replaceByMatchTable(body, replacements);
+                conclusion = wrap("V", body);
+                this.propositions = [];
+            }
+            rawConditions.forEach(c => this.addHypothese(c));
             conditions = this.propositions.map(p => p.value);
             assert.expand(conclusion, false);
         } finally { this.propositions = oldP; }
@@ -145,7 +179,7 @@ export class FormalSystem {
                     if (!astmgr.equal(rule.value, built.value)) throw new Error("延迟证明签名不一致 / Deferred proof signature mismatch: " + name);
                     return this.getProofSteps(built);
                 } finally {
-                    this.deductions[name] = previous;
+                    if (previous) this.deductions[name] = previous; else delete this.deductions[name];
                     if (generated) this.generated.set(name, generated); else this.generated.delete(name);
                     this.propositions = oldP;
                     this.fastmetarules = fmr;
@@ -1258,7 +1292,7 @@ export class FormalSystem {
     }
 
     metaExistTheorem(idx: string, from: string) {
-        return this.generateRule(() => this.metaExistTheoremChecked(idx, from));
+        return this.generateRule(() => this.deferTransform("e", idx, from, () => this.metaExistTheoremChecked(idx, from)));
     }
     private metaExistTheoremChecked(idx: string, from: string) {
         const d = this.generateDeduction(idx);
@@ -1296,7 +1330,7 @@ export class FormalSystem {
         }
     }
     metaConditionUniversalTheorem(idx: string, from: string) {
-        return this.generateRule(() => this.deferLift("v", idx, from, () => this.metaConditionUniversalTheoremChecked(idx, from)));
+        return this.generateRule(() => this.deferTransform("v", idx, from, () => this.metaConditionUniversalTheoremChecked(idx, from)));
     }
     private metaConditionUniversalTheoremChecked(idx: string, from: string) {
         // mp
@@ -1366,7 +1400,7 @@ export class FormalSystem {
         }
     }
     metaUniversalTheorem(idx: string, from: string) {
-        return this.generateRule(() => this.metaUniversalTheoremChecked(idx, from));
+        return this.generateRule(() => this.deferTransform("u", idx, from, () => this.metaUniversalTheoremChecked(idx, from)));
     }
     private metaUniversalTheoremChecked(idx: string, from: string) {
         if (this.deductions["u" + idx]) return "u" + idx;
@@ -1375,6 +1409,7 @@ export class FormalSystem {
         if (!d.conditions.length) {
             this.metaConditionUniversalTheorem(idx, from);
             this.deductions["u" + idx] = this.deductions["v" + idx];
+            this.generated.set("u" + idx, this.deductions["u" + idx]);
             return "u" + idx;
         }
         const s = this._findNewReplName(idx);
@@ -1634,7 +1669,7 @@ export class FormalSystem {
         }
     }
     metaConditionTheorem(idx: string, from: string) {
-        return this.generateRule(() => this.deferLift("c", idx, from, () => this.metaConditionTheoremChecked(idx, from)));
+        return this.generateRule(() => this.deferTransform("c", idx, from, () => this.metaConditionTheoremChecked(idx, from)));
     }
     private metaConditionTheoremChecked(idx: string, from: string) {
         // mp
@@ -1719,7 +1754,7 @@ export class FormalSystem {
         }
     }
     metaDeductTheorem(idx: string, from: string) {
-        return this.generateRule(() => this.metaDeductTheoremChecked(idx, from));
+        return this.generateRule(() => this.deferTransform(">", idx, from, () => this.metaDeductTheoremChecked(idx, from)));
     }
     private metaDeductTheoremChecked(idx: string, from: string) {
         if (idx[0] === "<") { this.generateDeduction(idx.slice(1)); return idx.slice(1); }
@@ -1816,7 +1851,7 @@ export class FormalSystem {
         }
     }
     metaInvDeductTheorem(idx: string, from: string) {
-        return this.generateRule(() => this.metaInvDeductTheoremChecked(idx, from));
+        return this.generateRule(() => this.deferTransform("<", idx, from, () => this.metaInvDeductTheoremChecked(idx, from)));
     }
     private metaInvDeductTheoremChecked(idx: string, from: string) {
         // >a => a

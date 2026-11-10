@@ -106,26 +106,71 @@ export class FormalSystem {
         this.deductions[name].liftable = liftable;
         return name;
     }
-    /** c/v are admissible for checked macros in this Hilbert calculus. Keep
-     * the existing proof transformer as the explicit, one-level proof recipe.
-     * Unknown conditional primitives still take its original checked path. */
-    deferLift(op, input, from, build) {
+    /** Derive a signature without materializing any referenced proof body.
+     * The original transformer remains the explicit, one-level proof recipe. */
+    deferTransform(op, input, from, build) {
+        // Preserve the existing inverse cancellations and atomic-rule checks.
+        if ((op === ">" && input[0] === "<") || (op === "<" && input[0] === ">"))
+            return build();
         const name = op + input;
         if (this.deductions[name])
             return name;
         const d = this.generateDeduction(input);
-        if (!d || (op === "v" && !this.isMacro(d)) || !this.canLift(d))
+        if (!d)
+            return build();
+        if (op === ">" && (!d.conditions.length || input === "mp"))
+            return build();
+        if (op === "<" && (d.conclusion.type !== "sym" || d.conclusion.name !== ">"))
+            return build();
+        if (op === "e" && d.conditions.length !== 1)
+            return build();
+        if (op === "u" && !d.conditions.length)
+            return build();
+        if (["v", ">", "u"].includes(op) && !this.isMacro(d))
+            return build();
+        if (!this.canLift(d))
             return build();
         const variable = this._findNewReplName(input);
-        const wrap = (ast) => ({ type: "sym", name: op === "c" ? ">" : "V", nodes: [astmgr.clone(variable), astmgr.clone(ast)] });
+        const wrap = (symbol, ast) => ({ type: "sym", name: symbol, nodes: [astmgr.clone(variable), astmgr.clone(ast)] });
         // addHypothese/expand retain the assertion normalization used by the
         // proof transformer, without visiting any of the input's subproofs.
         const oldP = this.propositions;
         let conditions;
-        const conclusion = wrap(d.conclusion);
+        let rawConditions = d.conditions;
+        let conclusion;
         try {
             this.propositions = [];
-            d.conditions.forEach(c => this.addHypothese(wrap(c)));
+            if (op === "c" || op === "v" || op === "e") {
+                const symbol = op === "c" ? ">" : op === "e" ? "E" : "V";
+                rawConditions = d.conditions.map(c => wrap(symbol, c));
+                conclusion = wrap(symbol, d.conclusion);
+            }
+            else if (op === ">") {
+                rawConditions = d.conditions.slice(0, -1);
+                conclusion = { type: "sym", name: ">", nodes: [astmgr.clone(d.conditions[d.conditions.length - 1]), astmgr.clone(d.conclusion)] };
+            }
+            else if (op === "<") {
+                rawConditions = [...d.conditions, d.conclusion.nodes[0]];
+                conclusion = astmgr.clone(d.conclusion.nodes[1]);
+            }
+            else {
+                // Use the same hypothesis normalization and match table as
+                // the original generalization transformer. Re-applying d to
+                // the wrapped hypotheses would impose different constraints.
+                const replacements = {};
+                for (const c of d.conditions) {
+                    if (assert.nf(variable.name, c) === -1)
+                        throw TR("元推理结论规则中的条件中的#nf函数永远无法通过验证");
+                    this.addHypothese({ type: "fn", name: "#nf", nodes: [astmgr.clone(c), astmgr.clone(variable)] });
+                    assert.match(this.propositions[this.propositions.length - 1].value, c, /^\$/, false, replacements, {}, null, []);
+                }
+                rawConditions = this.propositions.map(p => p.value);
+                const body = astmgr.clone(d.conclusion);
+                astmgr.replaceByMatchTable(body, replacements);
+                conclusion = wrap("V", body);
+                this.propositions = [];
+            }
+            rawConditions.forEach(c => this.addHypothese(c));
             conditions = this.propositions.map(p => p.value);
             assert.expand(conclusion, false);
         }
@@ -155,7 +200,10 @@ export class FormalSystem {
                     return this.getProofSteps(built);
                 }
                 finally {
-                    this.deductions[name] = previous;
+                    if (previous)
+                        this.deductions[name] = previous;
+                    else
+                        delete this.deductions[name];
                     if (generated)
                         this.generated.set(name, generated);
                     else
@@ -1381,7 +1429,7 @@ export class FormalSystem {
         }, from);
     }
     metaExistTheorem(idx, from) {
-        return this.generateRule(() => this.metaExistTheoremChecked(idx, from));
+        return this.generateRule(() => this.deferTransform("e", idx, from, () => this.metaExistTheoremChecked(idx, from)));
     }
     metaExistTheoremChecked(idx, from) {
         const d = this.generateDeduction(idx);
@@ -1424,7 +1472,7 @@ export class FormalSystem {
         }
     }
     metaConditionUniversalTheorem(idx, from) {
-        return this.generateRule(() => this.deferLift("v", idx, from, () => this.metaConditionUniversalTheoremChecked(idx, from)));
+        return this.generateRule(() => this.deferTransform("v", idx, from, () => this.metaConditionUniversalTheoremChecked(idx, from)));
     }
     metaConditionUniversalTheoremChecked(idx, from) {
         // mp
@@ -1504,7 +1552,7 @@ export class FormalSystem {
         }
     }
     metaUniversalTheorem(idx, from) {
-        return this.generateRule(() => this.metaUniversalTheoremChecked(idx, from));
+        return this.generateRule(() => this.deferTransform("u", idx, from, () => this.metaUniversalTheoremChecked(idx, from)));
     }
     metaUniversalTheoremChecked(idx, from) {
         if (this.deductions["u" + idx])
@@ -1515,6 +1563,7 @@ export class FormalSystem {
         if (!d.conditions.length) {
             this.metaConditionUniversalTheorem(idx, from);
             this.deductions["u" + idx] = this.deductions["v" + idx];
+            this.generated.set("u" + idx, this.deductions["u" + idx]);
             return "u" + idx;
         }
         const s = this._findNewReplName(idx);
@@ -1822,7 +1871,7 @@ export class FormalSystem {
         }
     }
     metaConditionTheorem(idx, from) {
-        return this.generateRule(() => this.deferLift("c", idx, from, () => this.metaConditionTheoremChecked(idx, from)));
+        return this.generateRule(() => this.deferTransform("c", idx, from, () => this.metaConditionTheoremChecked(idx, from)));
     }
     metaConditionTheoremChecked(idx, from) {
         // mp
@@ -1917,7 +1966,7 @@ export class FormalSystem {
         }
     }
     metaDeductTheorem(idx, from) {
-        return this.generateRule(() => this.metaDeductTheoremChecked(idx, from));
+        return this.generateRule(() => this.deferTransform(">", idx, from, () => this.metaDeductTheoremChecked(idx, from)));
     }
     metaDeductTheoremChecked(idx, from) {
         if (idx[0] === "<") {
@@ -2029,7 +2078,7 @@ export class FormalSystem {
         }
     }
     metaInvDeductTheorem(idx, from) {
-        return this.generateRule(() => this.metaInvDeductTheoremChecked(idx, from));
+        return this.generateRule(() => this.deferTransform("<", idx, from, () => this.metaInvDeductTheoremChecked(idx, from)));
     }
     metaInvDeductTheoremChecked(idx, from) {
         // >a => a

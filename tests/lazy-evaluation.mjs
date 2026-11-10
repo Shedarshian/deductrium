@@ -70,6 +70,44 @@ test('one-level expansion preserves child references', () => {
     assert.equal(fs.propositions[0].from.deductionIdx, 't18');
 });
 
+test('nested discharge/generalization signatures and one-level expansion never load descendant proofs', () => {
+    const fs = system();
+    saves.deserializeDeduction('lemma', fs, ['$1,$2,$3,$4,$5,$6⊢$0>$0', 'user*', [['.i', [], ['$0']]]]);
+    let lemmaLoads = 0;
+    fs.deductions.lemma.proof.load = () => { lemmaLoads++; throw new Error('descendant proof must stay deferred'); };
+    const nested = 'vvvvvv>>>>>>lemma';
+    const rule = fs.generateDeduction(nested);
+    assert.equal(lemmaLoads, 0);
+    assert.ok(rule.proof);
+    saves.deserializeDeduction('request', fs, ['$h⊢' + str(rule.conclusion), 'user*', [
+        [nested, [], [...rule.replaceNames]],
+        ['<a1', [-1], ['$h']],
+        ['mp', [-1, 0], []]
+    ]]);
+    const loaded = [];
+    for (const [name, d] of Object.entries(fs.deductions)) {
+        if (!d.proof) continue;
+        const load = d.proof.load;
+        d.proof.load = () => { loaded.push(name); return load(); };
+    }
+    const requested = fs.generateDeduction('>request');
+    assert.equal(requested.conditions.length, 0);
+    assert.deepEqual(loaded, [], 'querying a discharge signature must not evaluate its body');
+    fs.expandMacroWithDefaultValue('>request');
+    assert.equal(lemmaLoads, 0);
+    assert.ok(loaded.includes('request'));
+    assert.ok(!loaded.includes(nested), 'one-level expansion must preserve the nested child reference');
+    assert.equal(str(fs.propositions.at(-1).value), str(requested.conclusion));
+});
+
+test('all unary meta-rule signature queries leave their input proof body untouched', () => {
+    for (const [name, input] of [['>.t', '.t'], ['<.i', '.i'], ['u.t', '.t'], ['e.cs', '.cs'], ['u.Vcn', '.Vcn']]) {
+        const fs = system();
+        fs.deductions[input].proof.load = () => { throw new Error('signature query forced proof: ' + input); };
+        assert.ok(fs.generateDeduction(name)?.proof, name);
+    }
+});
+
 test('the existing save format round-trips lazy user macros and propositions', () => {
     const fs = system();
     const name = chain(fs, 30);
@@ -163,6 +201,17 @@ test('derived rule cache stays bounded and evicted entries can be regenerated', 
     assert.ok(fs.deductions['.1@N'] === undefined);
     assert.equal(str(fs.generateDeduction('.1@N').conclusion), '1@N');
     assert.ok(fs.deductions['.i']);
+});
+
+test('evicted generalization aliases can still load a retained recipe without leaving empty entries', () => {
+    const fs = system();
+    const retained = fs.generateDeduction('u.i');
+    for (let i = 1; i < 650; i++) fs.generateDeduction('.' + i + '@N');
+    assert.equal(fs.deductions['u.i'], undefined);
+    assert.equal(fs.deductions['v.i'], undefined);
+    assert.ok(fs.getProofSteps(retained)?.length);
+    assert.ok(Object.values(fs.deductions).every(Boolean));
+    assert.ok(fs.generateDeduction('u.i'));
 });
 
 test('every builtin macro can materialize c/v recipes with the advertised signature', () => {
