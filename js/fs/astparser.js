@@ -1,4 +1,5 @@
 import { TR } from "../lang.js";
+import { activeBudget } from "./evaluation.js";
 export class ASTParser {
     keywords = ["E!", "⊢M", "<>", "Union", "{}", "Equiv", "<=", ">=", "/|"];
     symChar = "VEMUIX()@~^<>|&=,;:[]!⊢+-*/{}\\";
@@ -102,6 +103,7 @@ export class ASTParser {
         return this.tokens[this.cursor - index - 1];
     }
     nextSym() {
+        activeBudget?.check(1);
         this.token = this.tokens[this.cursor++];
     }
     moveCursor(cursor) {

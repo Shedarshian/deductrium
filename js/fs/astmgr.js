@@ -1,5 +1,7 @@
+import { activeBudget } from "./evaluation.js";
 export class ASTMgr {
     clone(ast) {
+        activeBudget?.check(1);
         const newast = {
             type: ast.type, name: ast.name
         };
