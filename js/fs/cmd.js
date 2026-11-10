@@ -9,6 +9,7 @@ export class FSCmd {
     autoCompleteIdx = -1;
     gui;
     lastDeduction = null;
+    pendingExpansion;
     savesParser = new SavesParser;
     // onsave: () => string;
     // onload: (s: string) => void;
@@ -41,6 +42,11 @@ export class FSCmd {
         });
     }
     actionInputKeydown(e) {
+        if (this.pendingExpansion) {
+            if (e.key === "Escape")
+                this.clearCmdBuffer();
+            return false;
+        }
         const actionInput = this.gui.actionInput;
         // autoComplete:
         let currentIndex = this.autoCompleteIdx;
@@ -203,6 +209,10 @@ export class FSCmd {
         this.showhints(list);
     }
     clearCmdBuffer() {
+        if (this.pendingExpansion) {
+            this.pendingExpansion.abort();
+            return;
+        }
         if (this.pListMasked) {
             this.gui.clearPListMasked();
             this.pListMasked = false;
@@ -222,6 +232,8 @@ export class FSCmd {
         }
     }
     execCmdBuffer() {
+        if (this.pendingExpansion)
+            return;
         const cmdBuffer = this.cmdBuffer;
         const hintText = this.gui.hintText;
         if (!this.gui.isMobile)
@@ -278,10 +290,12 @@ export class FSCmd {
             if (cmdBuffer[0].includes(" ")) {
                 const queue = cmdBuffer[0].replaceAll(/\s([@=\+\-\*XUI><&\|\\]|<>)\s/g, "$1").replaceAll(/([,\(\:])\s+/g, "$1").split(" ").filter(e => e);
                 this.cmdBuffer = [];
-                for (const c of queue) {
-                    this.cmdBuffer.push(c);
-                    this.execCmdBuffer();
-                }
+                return (async () => {
+                    for (const c of queue) {
+                        this.cmdBuffer.push(c);
+                        await this.execCmdBuffer();
+                    }
+                })();
             }
             else {
                 if (cmdBuffer.length === 1) {
@@ -311,7 +325,32 @@ export class FSCmd {
             hintText.innerText = TR(`意外的错误：`) + e;
         }
     }
-    execExpand() {
+    async prepareExpansion(name) {
+        if (!name)
+            return;
+        const controller = new AbortController();
+        const fs = this.gui.formalSystem;
+        const buffer = this.cmdBuffer;
+        const readOnly = this.gui.actionInput.readOnly;
+        this.pendingExpansion = controller;
+        this.gui.actionInput.readOnly = true;
+        try {
+            await fs.prepareExpansion(name, {
+                signal: controller.signal, allowAllMetaRules: true,
+                onProgress: ({ rules }) => {
+                    this.gui.hintText.innerText = TR("正在准备展开") + ` (${rules}) ` + TR("，按 Esc 取消");
+                }
+            });
+            if (this.gui.formalSystem !== fs || this.cmdBuffer !== buffer)
+                throw new Error("展开状态已变化，请重试 / Expansion state changed");
+        }
+        finally {
+            if (this.pendingExpansion === controller)
+                this.pendingExpansion = undefined;
+            this.gui.actionInput.readOnly = readOnly;
+        }
+    }
+    async execExpand() {
         const hintText = this.gui.hintText;
         // ["expand", "(d|p).", {props}, "p.", {props}, "p.", {props},....]
         if (this.cmdBuffer.length < 2) {
@@ -321,6 +360,16 @@ export class FSCmd {
         }
         if (this.cmdBuffer.length % 2 == 0) {
             const item = this.cmdBuffer[this.cmdBuffer.length - 1];
+            const name = /^p[0-9]+$/.test(item) ? this.gui.formalSystem.propositions[Number(item.slice(1))]?.from?.deductionIdx : item;
+            try {
+                await this.prepareExpansion(name);
+            }
+            catch (e) {
+                this.cmdBuffer.pop();
+                this.execCmdBuffer();
+                hintText.innerText += "\n" + e;
+                return;
+            }
             if (this.gui.getDeduction(item)) {
                 if (!this.escClear) {
                     this.cmdBuffer.pop();
@@ -395,7 +444,7 @@ export class FSCmd {
             }).filter(v => v).join(" > ")}${TR(" 共")}${(this.cmdBuffer.length - 1) / 2}${TR("层推理宏内，按Esc返回上一层定理表，或继续输入/点击要展开的定理")}`.replaceAll("<", "&lt;").replaceAll(">", "&gt;");
         }
     }
-    execInline() {
+    async execInline() {
         const cmdBuffer = this.cmdBuffer;
         const hintText = this.gui.hintText;
         const formalSystem = this.gui.formalSystem;
@@ -406,9 +455,15 @@ export class FSCmd {
         }
         if (cmdBuffer[1].startsWith("p"))
             cmdBuffer[1] = cmdBuffer[1].slice(1);
-        const fmr = formalSystem.fastmetarules;
-        const fsd = Object.assign({}, formalSystem.deductions);
+        let fmr;
+        let fsd;
+        let started = false;
         try {
+            const proposition = formalSystem.propositions[cmdBuffer[1]];
+            await this.prepareExpansion(proposition?.from?.deductionIdx ?? cmdBuffer[1]);
+            fmr = formalSystem.fastmetarules;
+            fsd = Object.assign({}, formalSystem.deductions);
+            started = true;
             let inlineRule = false;
             if (!formalSystem.propositions[cmdBuffer[1]]) {
                 const d = this.gui.getDeduction(cmdBuffer[1]);
@@ -437,8 +492,10 @@ export class FSCmd {
         }
         catch (e) {
             this.clearCmdBuffer();
-            formalSystem.fastmetarules = fmr;
-            formalSystem.deductions = fsd;
+            if (started) {
+                formalSystem.fastmetarules = fmr;
+                formalSystem.deductions = fsd;
+            }
             this.gui.updatePropositionList(true);
             hintText.innerText = TR("展开定理出错：") + e;
         }
@@ -957,6 +1014,8 @@ export class FSCmd {
         hintText.innerText = TR(`请输入假设命题p`) + (hypCount === -1 ? formalSystem.propositions.length : hypCount) + TR(`，或按“Esc”结束`);
     }
     onClickSubAst(idx, inserted) {
+        if (this.pendingExpansion)
+            return;
         if (idx === "-")
             return;
         const cmdBuffer = this.cmdBuffer;
