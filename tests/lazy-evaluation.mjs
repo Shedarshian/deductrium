@@ -9,6 +9,7 @@ import { initFormalSystem } from '../js/fs/initial.js';
 import { SavesParser } from '../js/fs/savesparser.js';
 import { ASTParser } from '../js/fs/astparser.js';
 import { RuleParser } from '../js/fs/metarule.js';
+import { FSCmd } from '../js/fs/cmd.js';
 
 const parser = new ASTParser();
 const saves = new SavesParser(true);
@@ -68,6 +69,96 @@ test('one-level expansion preserves child references', () => {
     apply(fs, name, 'inline');
     assert.equal(fs.propositions.length, 1);
     assert.equal(fs.propositions[0].from.deductionIdx, 't18');
+});
+
+test('cold dependency preparation is automatic, cooperative and does not load proof bodies', async () => {
+    const fs = system();
+    const name = chain(fs, 2000);
+    fs.evaluationLimits.operations = 500;
+    assert.throws(() => fs.generateDeduction('v' + name), /budget/);
+    let loads = 0;
+    for (const d of Object.values(fs.deductions)) {
+        if (!d.proof) continue;
+        const load = d.proof.load;
+        d.proof.load = () => { loads++; return load(); };
+    }
+    let yielded = false;
+    setTimeout(() => { yielded = true; }, 0);
+    const before = JSON.stringify(fs.propositions);
+    await fs.prepareExpansion('v' + name, { onProgress: () => assert.equal(JSON.stringify(fs.propositions), before) });
+    assert.equal(yielded, true);
+    assert.equal(loads, 0);
+    assert.ok(fs.generateDeduction('v' + name));
+    fs.expandMacroWithDefaultValue('v' + name);
+    assert.equal(fs.propositions.length, 1);
+});
+
+test('preparation cancellation and concurrent rule/proposition changes preserve visible state', async () => {
+    const fs = system();
+    const name = chain(fs, 1000);
+    fs.addHypothese(parser.parse('A'));
+    const before = JSON.stringify(fs.propositions);
+    const controller = new AbortController();
+    const pending = fs.prepareExpansion(name, { signal: controller.signal });
+    controller.abort();
+    await assert.rejects(pending, /cancelled/);
+    assert.equal(JSON.stringify(fs.propositions), before);
+    const changed = fs.prepareExpansion(name);
+    fs.addDeduction('newrule', parser.parse('⊢B>B'), 'user');
+    await assert.rejects(changed, /Rules changed/);
+    const moved = fs.prepareExpansion(name);
+    fs.addHypothese(parser.parse('B'));
+    await assert.rejects(moved, /Propositions changed/);
+    assert.equal(fs.propositions.length, 2);
+    await fs.prepareExpansion(name);
+    const beforeFinal = fs.propositions.length;
+    await assert.rejects(fs.prepareExpansion(name, { onProgress: () => {
+        if (fs.propositions.length === beforeFinal) fs.addHypothese(parser.parse('C'));
+    } }), /Propositions changed/);
+    saves.deserializeDeduction('self', fs, ['⊢$0>$0', 'user*', [['self', [], ['$0']]]]);
+    await assert.rejects(fs.prepareExpansion('self'), /Cyclic/);
+});
+
+test('the expansion command prepares a cold dependency graph and allows Esc cancellation', async () => {
+    function command(fs, name) {
+        const cmd = Object.create(FSCmd.prototype);
+        Object.assign(cmd, { cmdBuffer: ['entr', name], escClear: true, pListMasked: false });
+        cmd.gui = { formalSystem: fs, isMobile: true, unlockedMacro: true, cmdBtns: [],
+            actionInput: { readOnly: false, value: '' }, hintText: { innerText: '', innerHTML: '' },
+            getDeduction: id => fs.generateDeduction(id), updatePropositionList() {} };
+        return cmd;
+    }
+    const fs = system();
+    const name = chain(fs, 1000);
+    fs.evaluationLimits.operations = 500;
+    const cancelled = command(fs, 'v' + name);
+    const pending = cancelled.execExpand();
+    assert.equal(cancelled.gui.actionInput.readOnly, true);
+    cancelled.clearCmdBuffer();
+    await pending;
+    assert.equal(cancelled.gui.actionInput.readOnly, false);
+    assert.equal(fs.propositions.length, 0);
+    const cmd = command(fs, 'v' + name);
+    await cmd.execExpand();
+    assert.equal(cmd.cmdBuffer.length, 3);
+    assert.equal(cmd.gui.actionInput.readOnly, false);
+    assert.equal(fs.propositions.length, 1);
+    fs.removePropositions();
+    const inline = command(fs, 'v' + name);
+    inline.cmdBuffer[0] = 'inln';
+    await inline.execInline();
+    assert.equal(inline.cmdBuffer.length, 0);
+    assert.equal(fs.propositions.length, 1);
+    fs.removePropositions();
+    const changed = command(fs, 'v' + name);
+    changed.cmdBuffer[0] = 'inln';
+    const editing = changed.execInline();
+    fs.addDeduction('concurrent', parser.parse('⊢A>A'), 'user');
+    fs.fastmetarules += '!';
+    await editing;
+    assert.ok(fs.deductions.concurrent, 'preparation must not roll back concurrent authoritative changes');
+    assert.ok(fs.fastmetarules.endsWith('!'));
+    assert.equal(fs.propositions.length, 0);
 });
 
 test('nested discharge/generalization signatures and one-level expansion never load descendant proofs', () => {

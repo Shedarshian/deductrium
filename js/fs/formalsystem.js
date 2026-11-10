@@ -19,10 +19,115 @@ export class FormalSystem {
     generated = new Map();
     generatedWeights = new WeakMap();
     liftability = new WeakMap();
+    environmentVersion = 0;
     isMacro(d) { return !!d && (d.steps !== undefined || d.proof !== undefined); }
     hasProofSteps(d) { return !!(d?.steps?.length || d?.proof?.length); }
     proofDependencies(d) {
         return d.proof?.dependencies ?? d.steps?.map(s => s.deductionIdx) ?? [];
+    }
+    *dependencyAtoms(rule) {
+        for (const dependency of this.proofDependencies(rule)) {
+            const atoms = [];
+            this.getAtomDeductionTokens(dependency, atoms);
+            for (const atom of atoms)
+                if (atom !== "#")
+                    yield atom;
+        }
+    }
+    /** Prepare admissibility certificates bottom-up, without reading proof
+     * bodies or consuming the visible expansion's single-operation budget.
+     * Large cold-cache dependency graphs yield to the UI between batches. */
+    async prepareExpansion(name, options = {}) {
+        const version = this.environmentVersion;
+        const propositions = this.propositions;
+        const saved = propositions.slice();
+        const deadline = performance.now() + 30_000;
+        const roots = [];
+        this.getAtomDeductionTokens(name, roots);
+        const visiting = new Set();
+        const stack = [];
+        let rules = 0, references = 0, ticks = 0;
+        const check = () => {
+            if (options.signal?.aborted)
+                throw new Error("已取消依赖准备 / Dependency preparation cancelled");
+            if (version !== this.environmentVersion)
+                throw new Error("规则已变化，请重新展开 / Rules changed during preparation");
+            if (performance.now() > deadline || rules > 100_000 || references > 1_000_000) {
+                throw new Error("依赖准备超过预算，已停止本次操作 / Dependency preparation budget exceeded");
+            }
+        };
+        const resolve = (atom) => {
+            const original = this.fastmetarules;
+            try {
+                if (options.allowAllMetaRules)
+                    this.fastmetarules = "cvuqe><:#zZQR";
+                return this.generateDeduction(atom);
+            }
+            finally {
+                this.fastmetarules = original;
+            }
+        };
+        const push = (rule) => {
+            if (visiting.has(rule))
+                throw new Error("循环证明依赖 / Cyclic proof dependency");
+            visiting.add(rule);
+            stack.push({ rule, atoms: this.dependencyAtoms(rule), supported: !!rule.liftable });
+        };
+        const report = () => options.onProgress?.({ rules, references });
+        check();
+        report();
+        // Paint the preparation hint and allow cancellation before starting.
+        await new Promise(done => setTimeout(done, 0));
+        let sliceStart = performance.now();
+        for (const root of roots) {
+            check();
+            if (root === "#")
+                continue;
+            const rule = resolve(root);
+            if (!rule || this.liftability.has(rule))
+                continue;
+            push(rule);
+            while (stack.length) {
+                if (++ticks % 256 === 0) {
+                    check();
+                    if (performance.now() - sliceStart >= 8) {
+                        report();
+                        await new Promise(done => setTimeout(done, 0));
+                        check();
+                        sliceStart = performance.now();
+                    }
+                }
+                const frame = stack[stack.length - 1];
+                const next = frame.atoms.next();
+                if (next.done) {
+                    this.liftability.set(frame.rule, frame.supported);
+                    rules++;
+                    visiting.delete(frame.rule);
+                    stack.pop();
+                    if (stack.length && !frame.supported)
+                        stack[stack.length - 1].supported = false;
+                }
+                else {
+                    references++;
+                    const child = resolve(next.value);
+                    if (!child) {
+                        frame.supported = false;
+                        continue;
+                    }
+                    const supported = this.liftability.get(child);
+                    if (supported === false)
+                        frame.supported = false;
+                    if (supported === undefined)
+                        push(child);
+                }
+            }
+        }
+        check();
+        report();
+        check();
+        if (this.propositions !== propositions || this.propositions.length !== saved.length || saved.some((p, i) => this.propositions[i] !== p)) {
+            throw new Error("定理列表已变化，请重新展开 / Propositions changed during preparation");
+        }
     }
     canLift(root) {
         const cached = this.liftability.get(root);
@@ -37,8 +142,11 @@ export class FormalSystem {
             if (exit) {
                 visiting.delete(rule);
                 visited.add(rule);
+                this.liftability.set(rule, true);
                 continue;
             }
+            if (this.liftability.get(rule) === false)
+                return false;
             if (visited.has(rule) || this.liftability.get(rule) === true)
                 continue;
             if (visiting.has(rule))
@@ -62,8 +170,6 @@ export class FormalSystem {
                 }
             }
         }
-        for (const rule of visited)
-            this.liftability.set(rule, true);
         return true;
     }
     getProofSteps(d) {
@@ -220,6 +326,7 @@ export class FormalSystem {
         return name;
     }
     invalidateGenerated() {
+        this.environmentVersion++;
         for (const [name, d] of this.generated) {
             if (this.deductions[name] === d)
                 delete this.deductions[name];
@@ -497,6 +604,10 @@ export class FormalSystem {
             (this.generationDepth > 0 || macro.every(s => this.deductions[s.deductionIdx]?.liftable));
         if (this.deductions[name])
             throw TR("规则名称 ") + name + TR(" 已存在");
+        if (!this.generationDepth) {
+            this.environmentVersion++;
+            this.liftability = new WeakMap();
+        }
         this.deductions[name] = deduction;
         if (this.generationDepth)
             this.generated.set(name, deduction);
