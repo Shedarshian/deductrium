@@ -35,6 +35,9 @@ export class FormalSystem {
     private generatedWeights = new WeakMap<Deduction, number>();
     private liftability = new WeakMap<Deduction, boolean>();
     private environmentVersion = 0;
+    private deductionDepth = 0;
+    private topLevelOneLevel = false;
+    private replayingCurrentLayer = false;
 
     isMacro(d: Deduction) { return !!d && (d.steps !== undefined || d.proof !== undefined); }
     private hasProofSteps(d: Deduction) { return !!(d?.steps?.length || d?.proof?.length); }
@@ -267,7 +270,8 @@ export class FormalSystem {
                 const generated = this.generated.get(name);
                 delete this.deductions[name];
                 try {
-                    const built = this.deductions[build()];
+                    const builtName = this.generateRule(() => this.fuseTransformProof(name, from, rule) ?? build());
+                    const built = this.deductions[builtName];
                     if (!astmgr.equal(rule.value, built.value)) throw new Error("延迟证明签名不一致 / Deferred proof signature mismatch: " + name);
                     return this.getProofSteps(built);
                 } finally {
@@ -282,6 +286,109 @@ export class FormalSystem {
         this.liftability.set(rule, true);
         if (this.generationDepth) this.generated.set(name, rule);
         return name;
+    }
+    private implicationContext(antecedents: AST[], conclusion: AST): AST {
+        let result = astmgr.clone(conclusion);
+        for (let i = antecedents.length - 1; i >= 0; i--) {
+            result = { type: "sym", name: ">", nodes: [astmgr.clone(antecedents[i]), result] };
+        }
+        return result;
+    }
+    private contextProjection(antecedents: AST[], index: number): number {
+        const remaining = antecedents.length - index;
+        let rule = remaining === 1 ? ".i" : "a1";
+        if (remaining >= 3) {
+            rule = ":ca1,.cs";
+            for (let i = 4; i <= remaining; i++) rule = ":c" + rule + ",.cs";
+        }
+        rule = "c".repeat(index) + rule;
+        const d = this.generateDeduction(rule);
+        const matches: ReplvarMatchTable = {};
+        assert.match(this.implicationContext(antecedents, antecedents[index]), d.conclusion, /^\$/, false, matches, {}, null, []);
+        return this.deduct({ deductionIdx: rule, conditionIdxs: [], replaceValues: d.replaceNames.map(name => matches[name]) });
+    }
+    /** Fuse v* >* over the original macro's immediate proof DAG. Repeatedly
+     * compiling each intermediate > proof duplicates administrative steps;
+     * the fused proof instead keeps conditioned/quantified references to the
+     * original steps. */
+    private fuseTransformProof(name: string, from: string, expected: Deduction): string | undefined {
+        let tree = this.getDeductionTokens(name);
+        let quantified = 0, discharged = 0;
+        while (tree[0] === "v" && tree.length === 2) { quantified++; tree = tree[1]; }
+        while (tree[0] === ">" && tree.length === 2) { discharged++; tree = tree[1]; }
+        if (!discharged || quantified + discharged < 2 || tree.length !== 1) return;
+        const baseName = tree[0];
+        const base = this.generateDeduction(baseName);
+        if (!this.hasProofSteps(base) || base.conditions.length < discharged) return;
+        const binders: AST[] = [];
+        let conclusion = expected.conclusion;
+        for (let i = 0; i < quantified; i++) {
+            if (conclusion.type !== "sym" || conclusion.name !== "V" || conclusion.nodes[0].type !== "replvar") return;
+            binders.push(conclusion.nodes[0]);
+            conclusion = conclusion.nodes[1];
+        }
+
+        // Replay exactly the base macro's immediate body. All referenced
+        // macros remain ordinary applications with inlineMode=null.
+        const replaying = this.replayingCurrentLayer;
+        this.replayingCurrentLayer = this.topLevelOneLevel;
+        try { this.expandMacroWithDefaultValue(baseName); } finally { this.replayingCurrentLayer = replaying; }
+        const source = this.propositions.slice();
+        const remaining = base.conditions.length - discharged;
+        const antecedents = source.slice(remaining, base.conditions.length).map(p => p.value);
+        this.propositions = [];
+        for (let i = 0; i < remaining; i++) this.currentLayerItem(() => this.addHypothese(source[i].value));
+        const mapped: number[] = [];
+        for (let i = 0; i < remaining; i++) {
+            let result = i;
+            for (let j = antecedents.length - 1; j >= 0; j--) {
+                result = this.currentLayerItem(() => this.deduct({ deductionIdx: "<a1", conditionIdxs: [result], replaceValues: [antecedents[j]] }));
+            }
+            mapped[i] = result;
+        }
+        for (let i = 0; i < antecedents.length; i++) mapped[remaining + i] = this.currentLayerItem(() => this.contextProjection(antecedents, i));
+        for (let i = base.conditions.length; i < source.length; i++) {
+            this.currentLayerItem(() => {
+                this.evaluation.check();
+                const step = source[i].from;
+                const rule = this.generateDeduction(step.deductionIdx);
+                mapped[i] = this.deduct({
+                    deductionIdx: "c".repeat(discharged) + step.deductionIdx,
+                    conditionIdxs: step.conditionIdxs.map(id => mapped[id]),
+                    replaceValues: rule.conditions.length ? step.replaceValues : [...antecedents, ...step.replaceValues]
+                });
+            });
+        }
+        if (quantified) {
+            const contextual = this.propositions.slice();
+            this.propositions = [];
+            const replacements: ReplvarMatchTable = Object.fromEntries(binders.map(binder => [binder.name, { type: "replvar", name: "#" + binder.name }]));
+            const wrap = (ast: AST): AST => {
+                let result = astmgr.clone(ast);
+                for (let i = binders.length - 1; i >= 0; i--) result = { type: "sym", name: "V", nodes: [astmgr.clone(binders[i]), result] };
+                return result;
+            };
+            const generalized: number[] = [];
+            for (let i = 0; i < remaining; i++) generalized[i] = this.currentLayerItem(() => this.addHypothese(wrap(contextual[i].value)));
+            for (let i = remaining; i < contextual.length; i++) {
+                this.currentLayerItem(() => {
+                    this.evaluation.check();
+                    const step = contextual[i].from;
+                    const rule = this.generateDeduction(step.deductionIdx);
+                    const values = step.replaceValues.map(value => {
+                        const renamed = astmgr.clone(value);
+                        astmgr.replaceByMatchTable(renamed, replacements);
+                        return renamed;
+                    });
+                    generalized[i] = this.deduct({
+                        deductionIdx: "v".repeat(quantified) + step.deductionIdx,
+                        conditionIdxs: step.conditionIdxs.map(id => generalized[id]),
+                        replaceValues: rule.conditions.length ? values : [...binders, ...values]
+                    });
+                });
+            }
+        }
+        return this.addMacro(name, from);
     }
     private invalidateGenerated() {
         this.environmentVersion++;
@@ -1131,29 +1238,55 @@ export class FormalSystem {
 
     deduct(step: DeductionStep, inlineMode?: DeductInlineMode | ((step: DeductionStep, conclusion: AST) => DeductInlineMode), partialTest?: boolean) {
         return this.evaluate(() => {
-            const stack = [{ rule: step.deductionIdx, expanding: !!inlineMode, iterator: this.deductChecked(step, inlineMode, partialTest) }];
-            const active = new Set(inlineMode ? [step.deductionIdx] : []);
-            let result: number;
-            while (stack.length) {
-                this.evaluation.check();
-                const frame = stack[stack.length - 1];
-                const next = frame.iterator.next(result);
-                if (next.done) {
-                    result = next.value;
-                    if (frame.expanding) active.delete(frame.rule);
-                    stack.pop();
-                } else {
-                    const child = next.value as { step: DeductionStep, mode: typeof inlineMode };
-                    if (child.mode && active.has(child.step.deductionIdx)) throw new Error("循环证明依赖 / Cyclic proof dependency: " + child.step.deductionIdx);
-                    if (child.mode) active.add(child.step.deductionIdx);
-                    stack.push({ rule: child.step.deductionIdx, expanding: !!child.mode, iterator: this.deductChecked(child.step, child.mode) });
-                    result = undefined;
+            const topLevel = this.deductionDepth++ === 0;
+            const previousOneLevel = this.topLevelOneLevel;
+            const independentItems = topLevel || (this.replayingCurrentLayer && this.topLevelOneLevel);
+            let oneLevel = independentItems && inlineMode === "inline";
+            if (topLevel) this.topLevelOneLevel = oneLevel;
+            try {
+                const stack = [{ rule: step.deductionIdx, expanding: !!inlineMode, iterator: this.deductChecked(step, inlineMode, partialTest, mode => {
+                    oneLevel = independentItems && mode === "inline";
+                    if (topLevel) this.topLevelOneLevel = oneLevel;
+                }) }];
+                const active = new Set(inlineMode ? [step.deductionIdx] : []);
+                let result: number;
+                while (stack.length) {
+                    if (!oneLevel) this.evaluation.check();
+                    const frame = stack[stack.length - 1];
+                    // A top-level one-layer operation applies independent child
+                    // references. Its work is bounded per current-layer item, not
+                    // by adding the cost of every item into a deep-proof budget.
+                    // Nested and deep expansion retain their shared budget.
+                    const next = oneLevel ? this.oneLevelItem(() => frame.iterator.next(result)) : frame.iterator.next(result);
+                    if (next.done) {
+                        result = next.value;
+                        if (frame.expanding) active.delete(frame.rule);
+                        stack.pop();
+                    } else {
+                        const child = next.value as { step: DeductionStep, mode: typeof inlineMode };
+                        if (child.mode && active.has(child.step.deductionIdx)) throw new Error("循环证明依赖 / Cyclic proof dependency: " + child.step.deductionIdx);
+                        if (child.mode) active.add(child.step.deductionIdx);
+                        stack.push({ rule: child.step.deductionIdx, expanding: !!child.mode, iterator: this.deductChecked(child.step, child.mode) });
+                        result = undefined;
+                    }
                 }
+                return result;
+            } finally {
+                this.deductionDepth--;
+                if (topLevel) this.topLevelOneLevel = previousOneLevel;
             }
-            return result;
         });
     }
-    private *deductChecked(step: DeductionStep, inlineMode?: DeductInlineMode | ((step: DeductionStep, conclusion: AST) => DeductInlineMode), partialTest?: boolean): Generator<{ step: DeductionStep, mode: typeof inlineMode }, number, number> {
+    private currentLayerItem<T>(action: () => T): T {
+        return this.topLevelOneLevel ? this.oneLevelItem(action) : action();
+    }
+    private oneLevelItem<T>(action: () => T): T {
+        const previous = this.evaluation;
+        const current = new EvaluationBudget(this.evaluationLimits);
+        this.evaluation = current;
+        try { return withBudget(current, action); } finally { this.evaluation = previous; }
+    }
+    private *deductChecked(step: DeductionStep, inlineMode?: DeductInlineMode | ((step: DeductionStep, conclusion: AST) => DeductInlineMode), partialTest?: boolean, onMode?: (mode: DeductInlineMode) => void): Generator<{ step: DeductionStep, mode: typeof inlineMode }, number, number> {
         const { conditionIdxs, deductionIdx, replaceValues } = step;
         const deduction = this.generateDeduction(deductionIdx);
         const errorMsg = TR(`规则 `) + deductionIdx + TR(` 推理失败:`);
@@ -1241,6 +1374,7 @@ export class FormalSystem {
 
         let netInlineMode = inlineMode;
         if (typeof netInlineMode === "function") netInlineMode = netInlineMode(step, replacedConclusion);
+        onMode?.(netInlineMode);
         if (!netInlineMode || !this.hasProofSteps(deduction)) {
             return this.propositions.push({ value: replacedConclusion, from: step }) - 1;
         }
