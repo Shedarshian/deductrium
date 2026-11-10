@@ -1,8 +1,10 @@
+import { activeBudget } from "./evaluation.js";
 export type AST = { type: string, name: string, nodes?: AST[] };
 export type ReplvarMatchTable = { [varname: string]: AST };
 
 export class ASTMgr {
     clone(ast: AST): AST {
+        activeBudget?.check(1);
         const newast: AST = {
             type: ast.type, name: ast.name
         };

@@ -490,7 +490,7 @@ export class FSGui {
     }
     _convert(d) {
         let str = this.cmd.astparser.stringifyTight(d.value);
-        let steps = d.steps?.map(step => [step.deductionIdx, step.conditionIdxs, step.replaceValues.map((v, i) => this.cmd.astparser.stringifyTight(v, this.formalSystem.assert.expand(v, d.replaceTypes[i])))]);
+        let steps = this.formalSystem.getProofSteps(d)?.map(step => [step.deductionIdx, step.conditionIdxs, step.replaceValues.map((v, i) => this.cmd.astparser.stringifyTight(v, this.formalSystem.assert.expand(v, d.replaceTypes[i])))]);
         if (d.tempvars?.size) {
             console.log(JSON.stringify([str, "内置宏", steps, Array.from(d.tempvars)]));
             return [str, JSON.stringify(steps), Array.from(d.tempvars)];
@@ -698,7 +698,7 @@ export class FSGui {
         });
         const from = this.deductionList.offsetHeight;
         this.drawDeductionList(ds, this.deductionList, (p, itInfo, it) => {
-            itInfo[0].innerText = TR(p.from).replace(/s$/, "").replaceAll("<", "&lt;").replaceAll(">", "&gt;") + (p.steps?.length ? TR("[宏]") : "");
+            itInfo[0].innerText = TR(p.from).replace(/s$/, "").replaceAll("<", "&lt;").replaceAll(">", "&gt;") + (this.formalSystem.isMacro(p) ? TR("[宏]") : "");
         }, this.deductions);
         const to = this.deductionList.offsetHeight;
         if (to > from) {

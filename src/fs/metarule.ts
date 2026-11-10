@@ -2,6 +2,7 @@ import { TR } from "../lang.js";
 import { AssertionSystem } from "./assertion.js";
 import { AST, ASTMgr, ReplvarMatchTable } from "./astmgr.js";
 import { ASTParser } from "./astparser.js";
+import { activeBudget } from "./evaluation.js";
 
 export type RuleTree = [string, ...RuleTree[]] | [string];
 export class RuleParser {
@@ -26,21 +27,16 @@ export class RuleParser {
         if (word !== "") {
             arr.push(word);
         }
-        let changed = true;
-        while (changed) {
-            changed = false;
-            for (let i = 0; i < arr.length; i++) {
-                if (arr[i].length > 1 && this.firstChar.includes(arr[i][0])) {
-                    // split arr[i] into arr[i][0] and arr[i].slice(1)
-                    const firstChar = arr[i][0];
-                    const rest = arr[i].slice(1);
-                    arr.splice(i, 1, firstChar, rest);
-                    i += 1;
-                    changed = true;
-                }
+        const result: string[] = [];
+        for (const word of arr) {
+            let pos = 0;
+            while (pos < word.length - 1 && this.firstChar.includes(word[pos])) {
+                activeBudget?.check();
+                result.push(word[pos++]);
             }
+            result.push(word.slice(pos));
         }
-        return arr;
+        return result;
     }
     private mergeMTokens(tokens: string[]): string[] {
         const result: string[] = [];
@@ -67,6 +63,8 @@ export class RuleParser {
         return result;
     }
     parse(s: string): RuleTree {
+        if (s.length > 16_384) throw new Error("规则名称过长 / Rule expression too long");
+        this.depth = 0;
         const arr = this.tokenise(s);
         this.tokens = this.mergeMTokens(arr);
         if (arr.length === 0) return;
@@ -89,12 +87,20 @@ export class RuleParser {
     }
     private tokens: string[] = [];
     private pos = 0;
+    private depth = 0;
     private nextToken() {
         if (this.pos < this.tokens.length) {
             return this.tokens[this.pos++];
         }
     }
     private nextRule(): RuleTree {
+        if (++this.depth > 256) { this.depth--; throw new Error("规则嵌套过深 / Rule expression depth exceeded"); }
+        try {
+            activeBudget?.enter();
+            try { return this.nextRuleChecked(); } finally { activeBudget?.leave(); }
+        } finally { this.depth--; }
+    }
+    private nextRuleChecked(): RuleTree {
         const token = this.nextToken();
         if (!token) throw TR("意外的规则名称表达式");
         if (token === ":") {

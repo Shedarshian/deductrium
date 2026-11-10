@@ -142,7 +142,9 @@ export class FSCmd {
             if (subValue) {
                 list = this.gui.deductions.filter(e => {
                     if (this.cmdBuffer[0] === "meta" && this.cmdBuffer[1] === "ifft") {
-                        const d = this.gui.formalSystem.deductions[e];
+                        if (e.startsWith("< f >")) return false;
+                        const d = this.gui.getDeduction(e);
+                        if (!d) return false;
                         if (d.conditions.length) return false;
                         if (d.conclusion.name !== "<>") return false;
                         if (d.conclusion.type !== "sym") return false;
@@ -749,16 +751,14 @@ export class FSCmd {
             const pos = this.gui.deductions.indexOf(this.cmdBuffer[1]);
             if (pos === -1) throw TR("列表中无此规则");
             const toRemove: string[] = [this.cmdBuffer[1]];
+            this.gui.formalSystem.removeDeduction(this.cmdBuffer[1]);
             for (const d of this.gui.deductions) {
-                if (!this.gui.formalSystem.deductions[d] && !d.startsWith("< f >")) {
+                if (!d.startsWith("< f >") && d !== this.cmdBuffer[1] && !this.gui.getDeduction(d)) {
                     toRemove.push(d);
                 }
             }
-            if (false === this.gui.formalSystem.removeDeduction(this.cmdBuffer[1])) {
-                this.gui.deductions[pos] = "< wait to remove >";
-            }
             this.gui.removeDeductionFolderCount(toRemove);
-            this.gui.deductions = this.gui.deductions.filter(d => (this.gui.formalSystem.deductions[d] || d.startsWith("< f >")));
+            this.gui.deductions = this.gui.deductions.filter(d => !toRemove.includes(d));
             this.gui.updateDeductionList();
             this.gui.updatePropositionList(true);
             this.clearCmdBuffer();
@@ -918,7 +918,7 @@ export class FSCmd {
         if (!cmdBuffer.length || (cmdBuffer.length === 1 && (cmdBuffer[0] === "d" || cmdBuffer[0] === "meta"))) {
             // click item to start a cmd
             if (cmdBuffer[0] === "d" && cmdBuffer.length === 1) {
-                if (!this.gui.formalSystem.deductions[idx]) {
+                if (!this.gui.getDeduction(idx)) {
                     this.gui.addSpan(this.gui.hintText, "<br>" + TR("\n请点选推理规则！"), true);
                     return;
                 }
@@ -934,7 +934,8 @@ export class FSCmd {
         }
         // deduction started, but wait for click props or replvars
         if (cmdBuffer[0] === "d" && cmdBuffer.length >= 2) {
-            const deduction = this.gui.formalSystem.deductions[cmdBuffer[1] === "." ? this.lastDeduction : cmdBuffer[1]];
+            const deduction = this.gui.getDeduction(cmdBuffer[1] === "." ? this.lastDeduction : cmdBuffer[1]);
+            if (!deduction) return;
             const vars = deduction.replaceNames.length;
             const conditions = deduction.conditions.length;
             if (conditions + 2 > cmdBuffer.length) {
@@ -958,7 +959,7 @@ export class FSCmd {
             const conditions = mr.conditionDeductionIdxs.length;
             if (conditions + 2 > cmdBuffer.length) {
                 //wait for conditionIdx input
-                if (!this.gui.formalSystem.deductions[idx]) {
+                if (!this.gui.getDeduction(idx)) {
                     this.gui.addSpan(this.gui.hintText, "<br>" + TR("\n请点选推理规则！"), true);
                     return;
                 }

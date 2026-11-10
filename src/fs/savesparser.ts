@@ -38,7 +38,8 @@ export class SavesParser {
     }
     serializeDeduction(deduction: Deduction): SerilizedDeduction {
         const value = astparser.stringifyTight(deduction.value);
-        const steps = deduction.steps?.map(s => this.serializeDeductionStep(s));
+        const steps = deduction.proof?.serialize ? deduction.proof.serialize() :
+            (deduction.steps ?? deduction.proof?.load())?.map(s => this.serializeDeductionStep(s));
         // if fs has tempvars record, then serialize it
         return deduction.tempvars?.size ? [value, deduction.from, steps, Array.from(deduction.tempvars)] : [value, deduction.from, steps];
     }
@@ -75,9 +76,25 @@ export class SavesParser {
         const val = astparser.parse(sd[0]);
         try{ this.assert.expand(val, false); }catch(e){}
 
-        fs.addDeduction(name, val, sd[1], sd[2]?.map(e => ({
-            deductionIdx: e[0].includes(">.a1_") ? this.fixbug260330(e[0]) : e[0].includes(":") ? this.fixbug260616(e[0]) : e[0], conditionIdxs: e[1], replaceValues: e[2].map(v => astparser.parse(v))
-        })), sd[3] ? new Set(sd[3]) : new Set());
+        const tempvars = sd[3] ? new Set(sd[3]) : new Set<string>();
+        if (sd[2] == null) {
+            fs.addDeduction(name, val, sd[1], undefined, tempvars);
+            // Imported rules are already trusted by this format (as before).
+            fs.deductions[name].liftable = name === "mp" || !fs.deductions[name].conditions.length;
+        } else {
+            // Copy the compact source so later caller mutation cannot change a rule.
+            // Migrate rule names now; parse replacement ASTs only when this body is used.
+            const source = sd[2].map(e => [
+                e[0].includes(">.a1_") ? this.fixbug260330(e[0]) : e[0].includes(":") ? this.fixbug260616(e[0]) : e[0],
+                [...e[1]], [...e[2]]
+            ] as SerilizedDeductionStep);
+            fs.addLazyDeduction(name, val, sd[1], {
+                length: source.length,
+                dependencies: source.map(e => e[0]),
+                load: () => source.map(e => this.deserializeDeductionStep(e)),
+                serialize: () => source.map(e => [e[0], [...e[1]], [...e[2]]])
+            }, tempvars, true);
+        }
     }
     serialize(gui: FSGui) {
         const fs = gui.formalSystem;

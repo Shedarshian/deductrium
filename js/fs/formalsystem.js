@@ -4,11 +4,278 @@ import { Proof } from "./proof.js";
 import { ASTParser } from "./astparser.js";
 import { TR } from "../lang.js";
 import { ConstrainSolver, RuleParser } from "./metarule.js";
+import { defaultEvaluationLimits, EvaluationBudget, withBudget } from "./evaluation.js";
 const astmgr = new ASTMgr;
 const assert = new AssertionSystem;
 const parser = new ASTParser;
 const ruleparser = new RuleParser();
 export class FormalSystem {
+    evaluationLimits = { ...defaultEvaluationLimits };
+    evaluation;
+    generating = new Set();
+    generationDepth = 0;
+    proofCache = new Map();
+    proofCacheSize = 0;
+    generated = new Map();
+    generatedWeights = new WeakMap();
+    liftability = new WeakMap();
+    isMacro(d) { return !!d && (d.steps !== undefined || d.proof !== undefined); }
+    hasProofSteps(d) { return !!(d?.steps?.length || d?.proof?.length); }
+    proofDependencies(d) {
+        return d.proof?.dependencies ?? d.steps?.map(s => s.deductionIdx) ?? [];
+    }
+    canLift(root) {
+        const cached = this.liftability.get(root);
+        if (cached !== undefined)
+            return cached;
+        const visiting = new Set();
+        const visited = new Set();
+        const stack = [{ rule: root, exit: false }];
+        while (stack.length) {
+            this.evaluation?.check();
+            const { rule, exit } = stack.pop();
+            if (exit) {
+                visiting.delete(rule);
+                visited.add(rule);
+                continue;
+            }
+            if (visited.has(rule) || this.liftability.get(rule) === true)
+                continue;
+            if (visiting.has(rule))
+                throw new Error("循环证明依赖 / Cyclic proof dependency");
+            if (!rule.liftable)
+                return false;
+            visiting.add(rule);
+            stack.push({ rule, exit: true });
+            // Inspect references, not transformed proof bodies. A conditional
+            // primitive needs an existing admissibility certificate (the mp seed).
+            for (const dependency of this.proofDependencies(rule)) {
+                const atoms = [];
+                this.getAtomDeductionTokens(dependency, atoms);
+                for (const atom of atoms) {
+                    if (atom === "#")
+                        continue;
+                    const child = this.generateDeduction(atom);
+                    if (!child)
+                        return false;
+                    stack.push({ rule: child, exit: false });
+                }
+            }
+        }
+        for (const rule of visited)
+            this.liftability.set(rule, true);
+        return true;
+    }
+    getProofSteps(d) {
+        return this.evaluate(() => this.getProofStepsChecked(d));
+    }
+    getProofStepsChecked(d) {
+        if (d.steps !== undefined || !d.proof)
+            return d.steps;
+        const cached = this.proofCache.get(d);
+        if (cached) {
+            this.proofCache.delete(d);
+            this.proofCache.set(d, cached);
+            return cached.steps;
+        }
+        this.evaluation?.check();
+        const steps = d.proof.load();
+        let weight = steps.length;
+        for (const step of steps) {
+            weight += step.conditionIdxs.length;
+            for (const value of step.replaceValues)
+                weight += this.astWeight(value);
+            if (weight > 100_000)
+                break;
+        }
+        // Large bodies can be consumed without retaining a second resident copy.
+        if (weight <= 100_000) {
+            while (this.proofCacheSize + weight > 100_000 || this.proofCache.size >= 128) {
+                const oldest = this.proofCache.keys().next().value;
+                this.proofCacheSize -= this.proofCache.get(oldest).weight;
+                this.proofCache.delete(oldest);
+            }
+            this.proofCache.set(d, { steps, weight });
+            this.proofCacheSize += weight;
+        }
+        return steps;
+    }
+    addLazyDeduction(name, value, from, proof, tempvars = new Set(), liftable = false) {
+        this.addDeduction(name, value, from, undefined, tempvars);
+        this.deductions[name].proof = { ...proof, load: () => this.evaluate(() => proof.load()) };
+        this.deductions[name].liftable = liftable;
+        return name;
+    }
+    /** c/v are admissible for checked macros in this Hilbert calculus. Keep
+     * the existing proof transformer as the explicit, one-level proof recipe.
+     * Unknown conditional primitives still take its original checked path. */
+    deferLift(op, input, from, build) {
+        const name = op + input;
+        if (this.deductions[name])
+            return name;
+        const d = this.generateDeduction(input);
+        if (!d || (op === "v" && !this.isMacro(d)) || !this.canLift(d))
+            return build();
+        const variable = this._findNewReplName(input);
+        const wrap = (ast) => ({ type: "sym", name: op === "c" ? ">" : "V", nodes: [astmgr.clone(variable), astmgr.clone(ast)] });
+        // addHypothese/expand retain the assertion normalization used by the
+        // proof transformer, without visiting any of the input's subproofs.
+        const oldP = this.propositions;
+        let conditions;
+        const conclusion = wrap(d.conclusion);
+        try {
+            this.propositions = [];
+            d.conditions.forEach(c => this.addHypothese(wrap(c)));
+            conditions = this.propositions.map(p => p.value);
+            assert.expand(conclusion, false);
+        }
+        finally {
+            this.propositions = oldP;
+        }
+        const value = { type: "meta", name: "⊢", nodes: [
+                { type: "fn", name: "#array", nodes: conditions },
+                { type: "fn", name: "#array", nodes: [conclusion] }
+            ] };
+        let rule;
+        this.addLazyDeduction(name, value, from, {
+            length: 1, dependencies: [input],
+            load: () => {
+                // Do not mutate the entry held by previews or other recipes.
+                // Nested lifts may be registered, but this temporary eager body
+                // is returned to the bounded proof cache rather than published.
+                const previous = this.deductions[name];
+                const oldP = this.propositions;
+                const fmr = this.fastmetarules;
+                const generated = this.generated.get(name);
+                delete this.deductions[name];
+                try {
+                    const built = this.deductions[build()];
+                    if (!astmgr.equal(rule.value, built.value))
+                        throw new Error("延迟证明签名不一致 / Deferred proof signature mismatch: " + name);
+                    return this.getProofSteps(built);
+                }
+                finally {
+                    this.deductions[name] = previous;
+                    if (generated)
+                        this.generated.set(name, generated);
+                    else
+                        this.generated.delete(name);
+                    this.propositions = oldP;
+                    this.fastmetarules = fmr;
+                }
+            }
+        }, new Set(d.tempvars), true);
+        rule = this.deductions[name];
+        this.liftability.set(rule, true);
+        if (this.generationDepth)
+            this.generated.set(name, rule);
+        return name;
+    }
+    invalidateGenerated() {
+        for (const [name, d] of this.generated) {
+            if (this.deductions[name] === d)
+                delete this.deductions[name];
+        }
+        this.generated.clear();
+        this.proofCache.clear();
+        this.proofCacheSize = 0;
+        this.liftability = new WeakMap();
+    }
+    astWeight(ast) {
+        const stack = [ast];
+        let weight = 0;
+        while (stack.length && weight <= 100_000) {
+            const value = stack.pop();
+            weight++;
+            if (value.nodes)
+                for (const node of value.nodes)
+                    stack.push(node);
+        }
+        return weight;
+    }
+    generateRule(action) {
+        return this.evaluate(() => {
+            this.generationDepth++;
+            try {
+                return action();
+            }
+            finally {
+                this.generationDepth--;
+            }
+        });
+    }
+    generateLiteral(action) {
+        return this.generateRule(() => {
+            const name = action();
+            // Literal templates are built by the kernel, and their c/v
+            // admissibility does not require enumerating numeric subproofs.
+            if (name)
+                this.liftability.set(this.deductions[name], true);
+            return name;
+        });
+    }
+    /** Atomic synchronous operation, including all nested rule generation. */
+    evaluate(action) {
+        if (this.evaluation) {
+            this.evaluation.enter();
+            try {
+                return action();
+            }
+            finally {
+                this.evaluation.leave();
+            }
+        }
+        const propositions = this.propositions;
+        const saved = propositions.slice();
+        const deductions = { ...this.deductions };
+        const generated = new Map(this.generated);
+        const fastmetarules = this.fastmetarules;
+        this.evaluation = new EvaluationBudget(this.evaluationLimits);
+        try {
+            return withBudget(this.evaluation, action);
+        }
+        catch (e) {
+            propositions.length = 0;
+            for (const proposition of saved)
+                propositions.push(proposition);
+            this.propositions = propositions;
+            this.deductions = deductions;
+            this.generated = generated;
+            throw e;
+        }
+        finally {
+            this.evaluation = undefined;
+            this.fastmetarules = fastmetarules;
+            // Derived entries are reproducible by name. Never evict user/initial rules.
+            for (const [name, d] of this.generated) {
+                if (this.deductions[name] !== d)
+                    this.generated.delete(name);
+            }
+            let weight = 0;
+            for (const d of this.generated.values()) {
+                if (!this.generatedWeights.has(d)) {
+                    let size = this.astWeight(d.value);
+                    for (const step of d.steps ?? []) {
+                        size += 1 + step.conditionIdxs.length;
+                        for (const value of step.replaceValues)
+                            size += this.astWeight(value);
+                        if (size > 100_000)
+                            break;
+                    }
+                    this.generatedWeights.set(d, size);
+                }
+                weight += this.generatedWeights.get(d);
+            }
+            while (this.generated.size > 512 || weight > 100_000) {
+                const name = this.generated.keys().next().value;
+                const d = this.generated.get(name);
+                weight -= this.generatedWeights.get(d);
+                if (this.deductions[name] === d)
+                    delete this.deductions[name];
+                this.generated.delete(name);
+            }
+        }
+    }
     deductions = {};
     metaRules = {};
     metaMacro = {};
@@ -79,13 +346,13 @@ export class FormalSystem {
         return name === deductionIdx || res.includes(name);
     }
     removeDeduction(name) {
-        if (!this.deductions[name])
+        if (!this.generateDeduction(name))
             throw TR("规则名称 ") + name + TR(" 不存在");
         if (this.getDeductionTokens(name).length > 1)
             return false; // this is composed, ignore it
         const composedDs = [];
         for (const [n, d] of Object.entries(this.deductions)) {
-            if (!d.steps)
+            if (!this.isMacro(d))
                 continue;
             if (name === n)
                 continue;
@@ -94,8 +361,8 @@ export class FormalSystem {
                     composedDs.push(n);
                 continue;
             }
-            for (const s of d.steps) {
-                if (this.getdependency(name, s.deductionIdx)) {
+            for (const dependency of this.proofDependencies(d)) {
+                if (this.getdependency(name, dependency)) {
                     throw TR("无法删除规则 ") + name + TR("，请先删除对其有依赖的规则 ") + n;
                 }
             }
@@ -118,6 +385,7 @@ export class FormalSystem {
             delete this.deductions[d];
         }
         delete this.deductions[name];
+        this.invalidateGenerated();
         return true;
     }
     renameDeduction(oldname, newname) {
@@ -132,7 +400,7 @@ export class FormalSystem {
             throw TR("规则名称 ") + newname + TR(" 已存在");
         const composedDs = [];
         for (const [n, d] of Object.entries(this.deductions)) {
-            if (!d.steps)
+            if (!this.isMacro(d))
                 continue;
             if (oldname === n)
                 continue;
@@ -142,7 +410,12 @@ export class FormalSystem {
                 }
                 continue;
             }
-            for (const s of d.steps) {
+            if (!this.proofDependencies(d).some(dependency => this.getdependency(oldname, dependency)))
+                continue;
+            // Publish a new entry: preview snapshots may still reference the old one.
+            const steps = this.getProofSteps(d).map(s => ({ ...s, conditionIdxs: [...s.conditionIdxs] }));
+            this.deductions[n] = { ...d, steps, proof: undefined };
+            for (const s of steps) {
                 if (this.getdependency(oldname, s.deductionIdx)) {
                     const tr = this.getDeductionTokens(s.deductionIdx);
                     ruleparser.replaceNameByName(tr, oldname, newname);
@@ -165,15 +438,20 @@ export class FormalSystem {
         }
         this.deductions[newname] = this.deductions[oldname];
         delete this.deductions[oldname];
+        this.invalidateGenerated();
     }
     addDeduction(name, d, from, macro, tempvars) {
         const deduction = this.ast2deduction(d);
         deduction.from = from;
         deduction.steps = macro;
         deduction.tempvars = tempvars ?? this.findLocalNamesInDeductionStep(macro);
+        deduction.liftable = !macro ? deduction.conditions.length === 0 :
+            (this.generationDepth > 0 || macro.every(s => this.deductions[s.deductionIdx]?.liftable));
         if (this.deductions[name])
             throw TR("规则名称 ") + name + TR(" 已存在");
         this.deductions[name] = deduction;
+        if (this.generationDepth)
+            this.generated.set(name, deduction);
         return name;
     }
     addMetaRule(name, m, conditionDeductionIdxs, replaceNames, from) {
@@ -284,9 +562,8 @@ export class FormalSystem {
         for (const step of steps) {
             for (const val of step.replaceValues) {
                 this.findLocalNamesInAst(val, this.localReplacedNameRule, res);
-                for (const subval of this.generateDeduction(step.deductionIdx).tempvars) {
-                    res.add(subval);
-                }
+                // Metadata belongs to this body. Referenced bodies are scoped
+                // separately when expanded; never generate them during registration.
             }
         }
         return res;
@@ -338,20 +615,12 @@ export class FormalSystem {
             throw TR("局部变量不能出现在推理宏的结论中");
         }
         const macro = [];
-        const subTempvars = new Set;
-        for (let i = hypothesisAmount; i <= propositionIdx; i++) {
-            for (const v of this.generateDeduction(this.propositions[i].from.deductionIdx).tempvars) {
-                subTempvars.add(v);
-            }
-        }
         for (let i = hypothesisAmount; i <= propositionIdx; i++) {
             const step = this.propositions[i].from;
             macro.push({
                 conditionIdxs: step.conditionIdxs.map(cidx => cidx < hypothesisAmount ? cidx : cidx - i),
                 replaceValues: step.replaceValues.map(v => {
                     const newv = astmgr.clone(v);
-                    // replace #0 to ##0, if conflict with substep, rename it as ##0#
-                    // this.replaceTempVar(newv, subTempvars);
                     return newv;
                 }),
                 deductionIdx: step.deductionIdx
@@ -486,6 +755,21 @@ export class FormalSystem {
         return true;
     }
     generateDeductionByToken(tree, name = ruleparser.stringify(tree)) {
+        return this.evaluate(() => {
+            if (this.generating.has(name))
+                throw new Error("循环规则依赖 / Cyclic rule dependency: " + [...this.generating, name].join(" -> "));
+            this.generating.add(name);
+            this.generationDepth++;
+            try {
+                return this.generateDeductionByTokenChecked(tree, name);
+            }
+            finally {
+                this.generationDepth--;
+                this.generating.delete(name);
+            }
+        });
+    }
+    generateDeductionByTokenChecked(tree, name) {
         if (this.deductions[name])
             return this.deductions[name];
         const unlocked = this.fastmetarules;
@@ -557,9 +841,16 @@ export class FormalSystem {
     generateDeduction(name) {
         if (!name)
             return null;
+        if (this.deductions[name])
+            return this.deductions[name];
+        // Bound parser recursion before entering RuleParser's recursive descent.
+        if (name.length > 16_384)
+            throw new Error("规则名称过长 / Rule expression too long");
         try {
-            const tokens = ruleparser.parse(name);
-            return this.generateDeductionByToken(tokens);
+            return this.evaluate(() => {
+                const tokens = ruleparser.parse(name);
+                return this.generateDeductionByToken(tokens);
+            });
         }
         catch (e) {
             if (e === "null")
@@ -570,6 +861,9 @@ export class FormalSystem {
         }
     }
     generateNatLiteralDef(name) {
+        return this.generateLiteral(() => this.generateNatLiteralDefChecked(name));
+    }
+    generateNatLiteralDefChecked(name) {
         const n = name.match(/^d([1-9][0-9]+)$/);
         if (!n || !isFinite(Number(n[1])))
             return;
@@ -579,6 +873,9 @@ export class FormalSystem {
         return this.addDeduction(name, parser.parse(`⊢${num} =S(${num - 1n})`), "算数符号定义");
     }
     generateNatLiteralIsNat(name, vnum = 0) {
+        return this.generateLiteral(() => this.generateNatLiteralIsNatChecked(name, vnum));
+    }
+    generateNatLiteralIsNatChecked(name, vnum = 0) {
         const vpre = "v".repeat(vnum);
         const n = name.match(/^\.([1-9][0-9]*)@N$/);
         if (!n || !isFinite(Number(n[1])))
@@ -606,6 +903,9 @@ export class FormalSystem {
         return this.addDeduction(vpre + name, parser.parse(`⊢${V}(${num}@N)`), "元规则生成*", steps, new Set());
     }
     generateNatLiteralOp(name, vnum = 0) {
+        return this.generateLiteral(() => this.generateNatLiteralOpChecked(name, vnum));
+    }
+    generateNatLiteralOpChecked(name, vnum = 0) {
         const vpre = "v".repeat(vnum);
         const n = name.match(/^\.(0|[1-9][0-9]*)([\+\*])(0|[1-9][0-9]*)$/);
         if (!n || !isFinite(Number(n[1])) || !isFinite(Number(n[3])))
@@ -642,6 +942,9 @@ export class FormalSystem {
         return this.addDeduction(vpre + name, parser.parse(`⊢${V}(${a}${op}${b}=${op === "+" ? a + b : a * b})`), "元规则生成*", steps, new Set());
     }
     generateZLiteralDef(name) {
+        return this.generateLiteral(() => this.generateZLiteralDefChecked(name));
+    }
+    generateZLiteralDefChecked(name) {
         const n = name.match(/^dZ([\+\-])?([0-9]|[1-9][0-9]+)$/);
         if (!n)
             return;
@@ -658,6 +961,9 @@ export class FormalSystem {
         return this.addDeduction(name, parser.parse(`⊢${num} = Z((${pos},${min}))`), "算数符号定义");
     }
     generateZLiteralIsZ(name) {
+        return this.generateLiteral(() => this.generateZLiteralIsZChecked(name));
+    }
+    generateZLiteralIsZChecked(name) {
         const n = name.match(/^\.([\+\-])?([0-9]|[1-9][0-9]+)@Z$/);
         if (!n)
             return;
@@ -679,6 +985,9 @@ export class FormalSystem {
         return this.addDeduction(name, parser.parse(`⊢(${num}@Z)`), "元规则生成*", steps, new Set());
     }
     generateZLiteralOp(name) {
+        return this.generateLiteral(() => this.generateZLiteralOpChecked(name));
+    }
+    generateZLiteralOpChecked(name) {
         const n = name.match(/^\.([\+\-])?([0-9]|[1-9][0-9]+)([\+\-\*])([\+\-])?([0-9]|[1-9][0-9]+)$/);
         if (!n)
             return;
@@ -760,6 +1069,9 @@ export class FormalSystem {
         return this.addDeduction(name, parser.parse(`⊢(${num1}${n[3]}${num2}=${num3 >= 0n ? "+" + num3 : num3})`), "元规则生成*", steps, new Set());
     }
     generateQLiteralDef(name) {
+        return this.generateLiteral(() => this.generateQLiteralDefChecked(name));
+    }
+    generateQLiteralDefChecked(name) {
         let n = name.match(/^dQ([\+\-])?([0-9]|[1-9][0-9]+)q?$/) || name.match(/^d([\+\-])?([0-9]|[1-9][0-9]+)q$/);
         if (this.deductions[name])
             return name;
@@ -776,6 +1088,9 @@ export class FormalSystem {
         return this.addDeduction(name, parser.parse(`⊢${num} = Q((${(n[1] ?? "+") + (int.replace(/^0*/, "") ?? "0")},+1${"0".repeat(b.length)}))`), "算数符号定义");
     }
     generateRLiteralDef(name) {
+        return this.generateLiteral(() => this.generateRLiteralDefChecked(name));
+    }
+    generateRLiteralDefChecked(name) {
         let n = name.match(/^dR([\+\-])?([0-9]|[1-9][0-9]+)r?$/) || name.match(/^d([\+\-])?([0-9]|[1-9][0-9]+)r$/);
         if (this.deductions[name])
             return name;
@@ -791,12 +1106,40 @@ export class FormalSystem {
         return this.addDeduction(name, parser.parse(`⊢${num}r = {x@Q|x<=${num}&~x=${num}}`), "算数符号定义");
     }
     deduct(step, inlineMode, partialTest) {
+        return this.evaluate(() => {
+            const stack = [{ rule: step.deductionIdx, expanding: !!inlineMode, iterator: this.deductChecked(step, inlineMode, partialTest) }];
+            const active = new Set(inlineMode ? [step.deductionIdx] : []);
+            let result;
+            while (stack.length) {
+                this.evaluation.check();
+                const frame = stack[stack.length - 1];
+                const next = frame.iterator.next(result);
+                if (next.done) {
+                    result = next.value;
+                    if (frame.expanding)
+                        active.delete(frame.rule);
+                    stack.pop();
+                }
+                else {
+                    const child = next.value;
+                    if (child.mode && active.has(child.step.deductionIdx))
+                        throw new Error("循环证明依赖 / Cyclic proof dependency: " + child.step.deductionIdx);
+                    if (child.mode)
+                        active.add(child.step.deductionIdx);
+                    stack.push({ rule: child.step.deductionIdx, expanding: !!child.mode, iterator: this.deductChecked(child.step, child.mode) });
+                    result = undefined;
+                }
+            }
+            return result;
+        });
+    }
+    *deductChecked(step, inlineMode, partialTest) {
         const { conditionIdxs, deductionIdx, replaceValues } = step;
         const deduction = this.generateDeduction(deductionIdx);
         const errorMsg = TR(`规则 `) + deductionIdx + TR(` 推理失败:`);
         if (!deduction)
             throw errorMsg + TR("规则不存在");
-        const { conditions, conclusion, replaceNames, steps, replaceTypes } = deduction;
+        const { conditions, conclusion, replaceNames, replaceTypes } = deduction;
         // firstly, match condition, get matchtable ( partial initially provided by users)
         let replacedVarTypeTable = {};
         let matchTable = partialTest ? {} : Object.fromEntries(replaceNames.map((replname, idx) => (assert.getReplVarsType(replaceValues[idx], replacedVarTypeTable, replaceTypes[replname]),
@@ -876,12 +1219,12 @@ export class FormalSystem {
         let netInlineMode = inlineMode;
         if (typeof netInlineMode === "function")
             netInlineMode = netInlineMode(step, replacedConclusion);
-        if (!steps?.length || !netInlineMode) {
+        if (!netInlineMode || !this.hasProofSteps(deduction)) {
             return this.propositions.push({ value: replacedConclusion, from: step }) - 1;
         }
         // if it is macro and inline, expand substeps 
-        let startPropositions = this.propositions.length;
-        let propsOffset = [];
+        const steps = this.getProofSteps(deduction);
+        const stepOutputs = [];
         // find outter tempvars
         let tempvars = new Set;
         Object.values(matchTable).forEach(v => this.findLocalNamesInAst(v, this.localNameRule, tempvars));
@@ -891,11 +1234,7 @@ export class FormalSystem {
             const replacedConditionIdxs = substep.conditionIdxs.map(idx => {
                 if (idx >= 0)
                     return conditionIdxs[idx];
-                let newIdx = this.propositions.length + idx;
-                for (let i = 0; i < -1 - idx; i++) {
-                    newIdx -= propsOffset[i];
-                }
-                return newIdx;
+                return stepOutputs[substepIdx + idx];
             });
             const replaceValues = substep.replaceValues.map(ast => {
                 const replaced = astmgr.clone(ast);
@@ -904,25 +1243,19 @@ export class FormalSystem {
                 astmgr.replaceByMatchTable(replaced, matchTable);
                 return replaced;
             });
-            let firstPos = this.propositions.length - 1;
-            let lastPos;
-            try {
-                lastPos = this.deduct({ deductionIdx: substep.deductionIdx, replaceValues, conditionIdxs: replacedConditionIdxs }, netInlineMode === "deep" ? inlineMode : null);
-            }
-            catch (e) {
-                // if one substep is wrong, remove newly added substeps from proplist
-                const substepErrMsg = errorMsg + TR(`子步骤`) + `${substepIdx + 1}(${substep.deductionIdx}` + TR(`)中 `) + e;
-                // while (this.propositions.length > startPropositions) {
-                //     this.propositions.pop();
-                // }
-                throw substepErrMsg;
-            }
-            propsOffset.unshift(lastPos - firstPos - 1);
+            const lastPos = yield { step: { deductionIdx: substep.deductionIdx, replaceValues, conditionIdxs: replacedConditionIdxs }, mode: netInlineMode === "deep" ? inlineMode : null };
+            stepOutputs.push(lastPos);
         }
         const propLength = this.propositions.length;
+        if (!astmgr.equal(this.propositions[propLength - 1]?.value, replacedConclusion)) {
+            throw new Error("展开结果与规则结论不一致 / Expanded proof does not match the rule conclusion: " + deductionIdx);
+        }
         return propLength - 1;
     }
     expandMacroWithProp(propositionIdx) {
+        return this.evaluate(() => this.expandMacroWithPropChecked(propositionIdx));
+    }
+    expandMacroWithPropChecked(propositionIdx) {
         const p = this.propositions[propositionIdx];
         if (!p.from)
             throw TR("该定理为假设，无推理步骤可展开");
@@ -930,7 +1263,7 @@ export class FormalSystem {
         if (!this.deductions[deductionIdx])
             this.deductions[deductionIdx] = this.generateDeduction(deductionIdx);
         const from = this.deductions[deductionIdx].from;
-        if (!this.deductions[deductionIdx].steps)
+        if (!this.isMacro(this.deductions[deductionIdx]))
             throw TR(`该定理由来自<`) + TR(deductionIdx[0] === "v" ? TR("一阶逻辑公理模式") : from) + TR(`>的原子推理规则得到，无子步骤`);
         const hyps = conditionIdxs.map(c => this.propositions[c].value);
         this.removePropositions();
@@ -941,13 +1274,16 @@ export class FormalSystem {
         }, "inline");
     }
     inlineMacroInProp(propositionIdx) {
+        return this.evaluate(() => this.inlineMacroInPropChecked(propositionIdx));
+    }
+    inlineMacroInPropChecked(propositionIdx) {
         const p = this.propositions[propositionIdx];
         if (!p.from)
             throw TR("该定理为假设，无推理步骤可展开");
         const { deductionIdx, conditionIdxs, replaceValues } = p.from;
         if (!this.deductions[deductionIdx])
             this.deductions[deductionIdx] = this.generateDeduction(deductionIdx);
-        if (!this.deductions[deductionIdx].steps)
+        if (!this.isMacro(this.deductions[deductionIdx]))
             throw TR(`该定理由来自<`) + TR(this.deductions[deductionIdx].from) + TR(`>的原子推理规则得到，无子步骤`);
         const suivant = [];
         while (true) {
@@ -969,15 +1305,20 @@ export class FormalSystem {
                 break;
             if (!p1.from)
                 continue;
-            this.propositions.push(p1);
-            p1.from.conditionIdxs = p1.from.conditionIdxs.map(id => id < propositionIdx ? id : id + offset);
+            this.evaluation.check();
+            this.propositions.push({ ...p1, from: { ...p1.from,
+                    conditionIdxs: p1.from.conditionIdxs.map(id => id < propositionIdx ? id : id + offset)
+                } });
         }
     }
     expandMacroWithDefaultValue(deductionIdx, inlineMode = "inline", expandAxiom) {
+        return this.evaluate(() => this.expandMacroWithDefaultValueChecked(deductionIdx, inlineMode, expandAxiom));
+    }
+    expandMacroWithDefaultValueChecked(deductionIdx, inlineMode = "inline", expandAxiom) {
         const d = this.deductions[deductionIdx] || this.generateDeduction(deductionIdx);
         if (!d)
             throw TR(`推理规则 `) + deductionIdx + TR(` 不存在`);
-        if (!expandAxiom && !d.steps)
+        if (!expandAxiom && !this.isMacro(d))
             throw TR(`无法展开原子推理规则`);
         this.removePropositions();
         d.conditions.forEach(dcond => this.addHypothese(dcond));
@@ -1010,12 +1351,15 @@ export class FormalSystem {
         return { type: "replvar", name };
     }
     metaQuantifyAxiomSchema(deductionIdx, from) {
+        return this.generateRule(() => this.metaQuantifyAxiomSchemaChecked(deductionIdx, from));
+    }
+    metaQuantifyAxiomSchemaChecked(deductionIdx, from) {
         const d = this.generateDeduction(deductionIdx);
         if (!d)
             throw TR(`推理规则 `) + deductionIdx + TR(` 不存在`);
         if (d.conditions?.length)
             throw TR("无法匹配带条件的推理规则");
-        if (d.steps?.length)
+        if (this.hasProofSteps(d))
             throw TR("无法匹配非公理推理规则");
         if (this.deductions["v" + deductionIdx])
             return "v" + deductionIdx;
@@ -1037,6 +1381,9 @@ export class FormalSystem {
         }, from);
     }
     metaExistTheorem(idx, from) {
+        return this.generateRule(() => this.metaExistTheoremChecked(idx, from));
+    }
+    metaExistTheoremChecked(idx, from) {
         const d = this.generateDeduction(idx);
         if (d.conditions.length !== 1)
             throw TR("匹配条件推理规则($$0 ⊢ $$1)失败");
@@ -1077,6 +1424,9 @@ export class FormalSystem {
         }
     }
     metaConditionUniversalTheorem(idx, from) {
+        return this.generateRule(() => this.deferLift("v", idx, from, () => this.metaConditionUniversalTheoremChecked(idx, from)));
+    }
+    metaConditionUniversalTheoremChecked(idx, from) {
         // mp
         if (this.deductions["v" + idx])
             return "v" + idx;
@@ -1088,15 +1438,25 @@ export class FormalSystem {
         const s = this._findNewReplName(idx);
         const SmatchTable = { [s.name]: { type: "replvar", name: "#" + s.name } };
         // axiom
-        if (!d.steps?.length && !d.conditions?.length) {
+        if (!this.hasProofSteps(d) && !d.conditions?.length) {
             return this.metaQuantifyAxiomSchema(idx, "元规则生成*");
         }
+        const steps = this.getProofSteps(d);
         // macro
         const offsetTable = [];
         const offsetCondTable = [];
         const generate = (condMode, idx) => {
-            idx ??= d.steps.length - 1 + d.conditions.length;
-            const step = d.steps[idx - d.conditions.length];
+            this.evaluation.enter();
+            try {
+                return generateChecked(condMode, idx);
+            }
+            finally {
+                this.evaluation.leave();
+            }
+        };
+        const generateChecked = (condMode, idx) => {
+            idx ??= steps.length - 1 + d.conditions.length;
+            const step = steps[idx - d.conditions.length];
             const sdidx = step?.deductionIdx;
             const sd = this.generateDeduction(sdidx);
             const stepReplaceValues = step?.replaceValues?.map(e => {
@@ -1144,6 +1504,9 @@ export class FormalSystem {
         }
     }
     metaUniversalTheorem(idx, from) {
+        return this.generateRule(() => this.metaUniversalTheoremChecked(idx, from));
+    }
+    metaUniversalTheoremChecked(idx, from) {
         if (this.deductions["u" + idx])
             return "u" + idx;
         const d = this.generateDeduction(idx);
@@ -1160,14 +1523,24 @@ export class FormalSystem {
                 throw TR(`元推理结论规则中的条件中的#nf函数永远无法通过验证`);
             }
         }
+        const steps = this.getProofSteps(d);
         // macro
         const offsetTable = [];
         const offsetCondTable = [];
         // find wrappers (e.g. #nf #vnf ..) for replvars in condition
         const replvarTable = {};
         const generate = (condMode, idx) => {
-            idx ??= d.steps.length - 1 + d.conditions.length;
-            const step = d.steps[idx - d.conditions.length];
+            this.evaluation.enter();
+            try {
+                return generateChecked(condMode, idx);
+            }
+            finally {
+                this.evaluation.leave();
+            }
+        };
+        const generateChecked = (condMode, idx) => {
+            idx ??= steps.length - 1 + d.conditions.length;
+            const step = steps[idx - d.conditions.length];
             // step may not exists, e.g. hyp
             const stepReplaceValues = step?.replaceValues?.map(v => {
                 const cv = astmgr.clone(v);
@@ -1232,6 +1605,10 @@ export class FormalSystem {
         }
     }
     metaNewConstant(replaceValues, from) {
+        return this.evaluate(() => this.metaNewConstantChecked(replaceValues, from));
+    }
+    metaNewConstantChecked(replaceValues, from) {
+        this.invalidateGenerated();
         const [constAst, varAst, exprAst] = replaceValues;
         if (constAst.type !== "replvar")
             throw TR("$$0只能为纯变量名");
@@ -1281,6 +1658,10 @@ export class FormalSystem {
         return d;
     }
     metaNewFunction(replaceValues, from) {
+        return this.evaluate(() => this.metaNewFunctionChecked(replaceValues, from));
+    }
+    metaNewFunctionChecked(replaceValues, from) {
+        this.invalidateGenerated();
         const [fnAst, varAst, exprAst, paramAsts] = replaceValues;
         if (!paramAsts.length)
             throw null;
@@ -1359,6 +1740,10 @@ export class FormalSystem {
         return d;
     }
     metaNewVerb(replaceValues, from) {
+        return this.evaluate(() => this.metaNewVerbChecked(replaceValues, from));
+    }
+    metaNewVerbChecked(replaceValues, from) {
+        this.invalidateGenerated();
         const [fnAst, exprAst, paramAsts] = replaceValues;
         if (!paramAsts.length)
             throw null;
@@ -1437,6 +1822,9 @@ export class FormalSystem {
         }
     }
     metaConditionTheorem(idx, from) {
+        return this.generateRule(() => this.deferLift("c", idx, from, () => this.metaConditionTheoremChecked(idx, from)));
+    }
+    metaConditionTheoremChecked(idx, from) {
         // mp
         if (this.deductions["c" + idx])
             return "c" + idx;
@@ -1467,9 +1855,19 @@ export class FormalSystem {
         // ...A |- B
         const offsetTable = [];
         const offsetCondTable = [];
+        const steps = this.getProofSteps(d);
         const generate = (condMode, idx) => {
-            idx ??= d.steps.length - 1 + d.conditions.length;
-            const step = d.steps[idx - d.conditions.length];
+            this.evaluation.enter();
+            try {
+                return generateChecked(condMode, idx);
+            }
+            finally {
+                this.evaluation.leave();
+            }
+        };
+        const generateChecked = (condMode, idx) => {
+            idx ??= steps.length - 1 + d.conditions.length;
+            const step = steps[idx - d.conditions.length];
             const sdidx = step?.deductionIdx;
             const sd = this.generateDeduction(sdidx);
             if (!condMode) {
@@ -1519,6 +1917,9 @@ export class FormalSystem {
         }
     }
     metaDeductTheorem(idx, from) {
+        return this.generateRule(() => this.metaDeductTheoremChecked(idx, from));
+    }
+    metaDeductTheoremChecked(idx, from) {
         if (idx[0] === "<") {
             this.generateDeduction(idx.slice(1));
             return idx.slice(1);
@@ -1534,15 +1935,33 @@ export class FormalSystem {
         if (idx === "mp")
             throw TR("元推理结论 >mp 为 (($0 > $1) ⊢ ($0 > $1))，假设与结论相同");
         // ...A, B |- C
-        let offsetTable = [];
-        let offsetCondTable = [];
+        const offsetTable = [];
+        const offsetCondTable = [];
         let s; // condAst
+        const steps = this.getProofSteps(d);
+        const dependsOnDischarged = d.conditions.map((_, i) => i === d.conditions.length - 1);
+        for (const [i, step] of steps.entries()) {
+            this.evaluation.check();
+            const current = d.conditions.length + i;
+            dependsOnDischarged[current] = step.conditionIdxs.some(id => dependsOnDischarged[id >= 0 ? id : current + id]);
+        }
         const generate = (condMode, idx) => {
-            idx ??= d.steps.length - 1 + d.conditions.length;
-            const step = d.steps[idx - d.conditions.length];
+            this.evaluation.enter();
+            try {
+                return generateChecked(condMode, idx);
+            }
+            finally {
+                this.evaluation.leave();
+            }
+        };
+        const generateChecked = (condMode, idx) => {
+            idx ??= steps.length - 1 + d.conditions.length;
+            const step = steps[idx - d.conditions.length];
             const sdidx = step?.deductionIdx;
             const sd = this.generateDeduction(sdidx);
             if (!condMode) {
+                if (dependsOnDischarged[idx])
+                    return -1;
                 // avoid repeated deductions on the same prop
                 if (isFinite(offsetTable[idx]))
                     return offsetTable[idx];
@@ -1550,15 +1969,11 @@ export class FormalSystem {
                 if (!step) {
                     return -1;
                 }
-                // mp, axiom or macros, if rely on hyp B, roll back recursively
-                const state = [offsetTable.slice(0), this.propositions.slice(0)];
+                // Dependency analysis above avoids speculative deductions and
+                // quadratic snapshots of the growing proposition list.
                 const condIdxs = [];
                 for (const id of step.conditionIdxs) {
                     const n = generate(false, id >= 0 ? id : idx + id);
-                    if (n === -1) {
-                        [offsetTable, this.propositions] = state;
-                        return -1;
-                    }
                     condIdxs.push(n);
                 }
                 offsetTable[idx] = this.deduct({
@@ -1614,6 +2029,9 @@ export class FormalSystem {
         }
     }
     metaInvDeductTheorem(idx, from) {
+        return this.generateRule(() => this.metaInvDeductTheoremChecked(idx, from));
+    }
+    metaInvDeductTheoremChecked(idx, from) {
         // >a => a
         if (idx[0] === ">") {
             this.generateDeduction(idx.slice(1));
@@ -1647,6 +2065,9 @@ export class FormalSystem {
         }
     }
     metaCompleteTheorem(ast, name, from) {
+        return this.evaluate(() => this.metaCompleteTheoremChecked(ast, name, from));
+    }
+    metaCompleteTheoremChecked(ast, name, from) {
         const proof = new Proof(this);
         const p = this.propositions;
         try {
@@ -1662,6 +2083,9 @@ export class FormalSystem {
         return name;
     }
     metaCombineTheorem(idx1s, idx2, from) {
+        return this.generateRule(() => this.metaCombineTheoremChecked(idx1s, idx2, from));
+    }
+    metaCombineTheoremChecked(idx1s, idx2, from) {
         const name = ":" + idx1s.join(":") + "," + idx2;
         if (this.deductions[name])
             return name;
@@ -1780,6 +2204,9 @@ export class FormalSystem {
         }
     }
     metaIffTheorem(idx, replaceValues, name, from, allowIFFT_RP) {
+        return this.evaluate(() => this.metaIffTheoremChecked(idx, replaceValues, name, from, allowIFFT_RP));
+    }
+    metaIffTheoremChecked(idx, replaceValues, name, from, allowIFFT_RP) {
         const d = this.generateDeduction(idx);
         if (!d)
             throw TR("推理规则不存在");

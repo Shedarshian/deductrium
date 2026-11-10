@@ -455,7 +455,7 @@ export class FSGui {
     }
     private _convert(d: Deduction) {
         let str = this.cmd.astparser.stringifyTight(d.value);
-        let steps = d.steps?.map(step => [step.deductionIdx, step.conditionIdxs, step.replaceValues.map((v, i) => this.cmd.astparser.stringifyTight(
+        let steps = this.formalSystem.getProofSteps(d)?.map(step => [step.deductionIdx, step.conditionIdxs, step.replaceValues.map((v, i) => this.cmd.astparser.stringifyTight(
             v, this.formalSystem.assert.expand(v, d.replaceTypes[i])
         ))]);
         if (d.tempvars?.size) {
@@ -649,7 +649,7 @@ export class FSGui {
 
         this.drawDeductionList(ds, this.deductionList,
             (p, itInfo, it) => {
-                itInfo[0].innerText = TR(p.from).replace(/s$/, "").replaceAll("<", "&lt;").replaceAll(">", "&gt;") + (p.steps?.length ? TR("[宏]") : "");
+                itInfo[0].innerText = TR(p.from).replace(/s$/, "").replaceAll("<", "&lt;").replaceAll(">", "&gt;") + (this.formalSystem.isMacro(p) ? TR("[宏]") : "");
             }, this.deductions
         );
 

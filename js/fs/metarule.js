@@ -2,6 +2,7 @@ import { TR } from "../lang.js";
 import { AssertionSystem } from "./assertion.js";
 import { ASTMgr } from "./astmgr.js";
 import { ASTParser } from "./astparser.js";
+import { activeBudget } from "./evaluation.js";
 export class RuleParser {
     fixbug260616 = false;
     symChar = ":,";
@@ -25,21 +26,16 @@ export class RuleParser {
         if (word !== "") {
             arr.push(word);
         }
-        let changed = true;
-        while (changed) {
-            changed = false;
-            for (let i = 0; i < arr.length; i++) {
-                if (arr[i].length > 1 && this.firstChar.includes(arr[i][0])) {
-                    // split arr[i] into arr[i][0] and arr[i].slice(1)
-                    const firstChar = arr[i][0];
-                    const rest = arr[i].slice(1);
-                    arr.splice(i, 1, firstChar, rest);
-                    i += 1;
-                    changed = true;
-                }
+        const result = [];
+        for (const word of arr) {
+            let pos = 0;
+            while (pos < word.length - 1 && this.firstChar.includes(word[pos])) {
+                activeBudget?.check();
+                result.push(word[pos++]);
             }
+            result.push(word.slice(pos));
         }
-        return arr;
+        return result;
     }
     mergeMTokens(tokens) {
         const result = [];
@@ -70,6 +66,9 @@ export class RuleParser {
         return result;
     }
     parse(s) {
+        if (s.length > 16_384)
+            throw new Error("规则名称过长 / Rule expression too long");
+        this.depth = 0;
         const arr = this.tokenise(s);
         this.tokens = this.mergeMTokens(arr);
         if (arr.length === 0)
@@ -94,12 +93,31 @@ export class RuleParser {
     }
     tokens = [];
     pos = 0;
+    depth = 0;
     nextToken() {
         if (this.pos < this.tokens.length) {
             return this.tokens[this.pos++];
         }
     }
     nextRule() {
+        if (++this.depth > 256) {
+            this.depth--;
+            throw new Error("规则嵌套过深 / Rule expression depth exceeded");
+        }
+        try {
+            activeBudget?.enter();
+            try {
+                return this.nextRuleChecked();
+            }
+            finally {
+                activeBudget?.leave();
+            }
+        }
+        finally {
+            this.depth--;
+        }
+    }
+    nextRuleChecked() {
         const token = this.nextToken();
         if (!token)
             throw TR("意外的规则名称表达式");
@@ -317,5 +335,5 @@ export class ConstrainSolver {
 [.ni]:.ne,<a3
 [.a30]>:::.ne,.t:.ni,.t,<a3
 [.mn]:::::c.i:a1,ccmp,c<.a30,<a2:.i,mp,<a3
-*/ 
+*/
 //# sourceMappingURL=metarule.js.map
