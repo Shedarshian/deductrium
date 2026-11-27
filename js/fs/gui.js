@@ -991,9 +991,11 @@ export class FSGui {
         }
         this.updateDeductionList();
     }
-    getDeduction(id) {
+    getDeduction(id, throwOnError = false) {
+        if (!id)
+            return null;
         if (id === ".")
-            return this.getDeduction(this.cmd.lastDeduction);
+            return this.getDeduction(this.cmd.lastDeduction, throwOnError);
         // if cuv is locked, can't use cmp and vmp
         if ("cuv".includes(id[0]) && !this.formalSystem.fastmetarules.includes(id[0])) {
             if (id[0] === "v" && this.formalSystem.fastmetarules.includes("q")) {
@@ -1024,6 +1026,8 @@ export class FSGui {
             return this.formalSystem.generateDeduction(id);
         }
         catch (e) {
+            if (throwOnError)
+                throw e;
             return null;
         }
     }

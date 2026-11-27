@@ -10,6 +10,7 @@ import { SavesParser } from '../js/fs/savesparser.js';
 import { ASTParser } from '../js/fs/astparser.js';
 import { RuleParser } from '../js/fs/metarule.js';
 import { FSCmd } from '../js/fs/cmd.js';
+import { ruleCommand, withCommandDom } from './command-harness.mjs';
 
 const parser = new ASTParser();
 const saves = new SavesParser(true);
@@ -159,6 +160,100 @@ test('the expansion command prepares a cold dependency graph and allows Esc canc
     assert.ok(fs.deductions.concurrent, 'preparation must not roll back concurrent authoritative changes');
     assert.ok(fs.fastmetarules.endsWith('!'));
     assert.equal(fs.propositions.length, 0);
+});
+
+test('shortcut, explicit deduction and mcvt all prepare cold dependencies before generating a rule', async () => {
+    await withCommandDom(async () => {
+        const signatures = [];
+        for (const kind of ['shortcut', 'explicit', 'mcvt', 'meta-shorthand', 'meta-click']) {
+            const fs = system();
+            const name = chain(fs, 1500);
+            fs.evaluationLimits.operations = 500;
+            let loads = 0;
+            for (const d of Object.values(fs.deductions)) if (d.proof) d.proof.load = () => { loads++; throw new Error('query loaded a body'); };
+            const buffer = kind === 'shortcut' ? ['v' + name] : kind === 'explicit' ? ['d', 'v' + name] :
+                kind === 'meta-shorthand' ? ['mcvt ' + name] : kind === 'meta-click' ? ['meta', 'cvt'] : ['meta', 'cvt', name];
+            const cmd = ruleCommand(fs, buffer);
+            await cmd.execCmdBuffer();
+            if (kind === 'meta-click') await cmd.onClickSubAst(name, name);
+            const result = fs.deductions['v' + name];
+            assert.ok(result, kind + ': ' + cmd.gui.hintText.innerText);
+            signatures.push(str(result.value));
+            assert.equal(loads, 0);
+            assert.equal(fs.propositions.length, 0);
+            assert.equal(cmd.gui.actionInput.readOnly, false);
+            assert.equal(cmd.failedQuery, false);
+            if (kind === 'shortcut' || kind === 'explicit') assert.deepEqual(cmd.cmdBuffer, ['d', 'v' + name]);
+            else assert.equal(cmd.cmdBuffer.length, 0);
+        }
+        assert.ok(signatures.every(signature => signature === signatures[0]));
+    });
+});
+
+test('rule shorthand with arguments awaits each asynchronous query before applying the theorem', async () => {
+    await withCommandDom(async () => {
+        const fs = system();
+        const cmd = ruleCommand(fs, ['v.i x A']);
+        await cmd.execCmdBuffer();
+        assert.equal(cmd.failedQuery, false, cmd.gui.hintText.innerText);
+        assert.equal(cmd.cmdBuffer.length, 0);
+        assert.equal(fs.propositions.length, 1);
+        assert.equal(fs.propositions[0].value.name, 'V');
+        assert.equal(fs.propositions[0].value.nodes[0].name, 'x');
+        assert.equal(str(fs.propositions[0].value.nodes[1]), 'A>A');
+        cmd.cmdBuffer = ['. y B'];
+        await cmd.execCmdBuffer();
+        assert.equal(fs.propositions.length, 2);
+        assert.equal(fs.propositions[1].value.nodes[0].name, 'y');
+        assert.equal(str(fs.propositions[1].value.nodes[1]), 'B>B');
+        cmd.cmdBuffer = ['copy v.i z C'];
+        await cmd.execCmdBuffer();
+        assert.equal(fs.propositions.length, 3);
+        assert.equal(fs.propositions[2].value.nodes[0].name, 'z');
+        const empty = ruleCommand(fs, ['.']);
+        await empty.execCmdBuffer();
+        assert.ok(!empty.gui.hintText.innerText.includes('TypeError'));
+    });
+});
+
+test('explicit lookups preserve generation errors while autocomplete remains best-effort', async () => {
+    await withCommandDom(async () => {
+        const fs = system();
+        const name = chain(fs, 100);
+        fs.evaluationLimits.operations = 1;
+        const cmd = ruleCommand(fs, ['v' + name]);
+        assert.equal(cmd.gui.getDeduction('v' + name), null);
+        assert.throws(() => cmd.gui.getDeduction('v' + name, true), /budget/);
+        await cmd.execCmdBuffer();
+        assert.match(cmd.gui.hintText.innerText, /budget/);
+        assert.ok(!cmd.gui.hintText.innerText.includes('Invalid command'));
+        cmd.cmdBuffer = ['d', 'v' + name];
+        await cmd.execCmdBuffer();
+        assert.match(cmd.gui.hintText.innerText, /budget/);
+        const broken = ruleCommand(fs, ['v' + name + ' A B']);
+        await broken.execCmdBuffer();
+        assert.match(broken.gui.hintText.innerText, /budget/, 'queued arguments must not overwrite the actual lookup failure');
+    });
+});
+
+test('shortcut preparation supports cancellation and does not bypass metarule unlocks', async () => {
+    await withCommandDom(async () => {
+        const fs = system();
+        const name = chain(fs, 1000);
+        const cmd = ruleCommand(fs, ['v' + name]);
+        const pending = cmd.execCmdBuffer();
+        cmd.clearCmdBuffer();
+        await pending;
+        assert.match(cmd.gui.hintText.innerText, /cancelled/);
+        assert.equal(cmd.gui.actionInput.readOnly, false);
+        assert.equal(fs.deductions['v' + name], undefined);
+        fs.fastmetarules = 'q';
+        cmd.cmdBuffer = ['v' + name];
+        await cmd.execCmdBuffer();
+        assert.equal(fs.fastmetarules, 'q');
+        assert.equal(fs.deductions['v' + name], undefined);
+        assert.ok(cmd.failedQuery);
+    });
 });
 
 test('nested discharge/generalization signatures and one-level expansion never load descendant proofs', () => {

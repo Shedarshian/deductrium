@@ -14,6 +14,7 @@ export class FSCmd {
     gui: FSGui;
     lastDeduction: string = null;
     private pendingExpansion?: AbortController;
+    private failedQuery = false;
     savesParser = new SavesParser;
     // onsave: () => string;
     // onload: (s: string) => void;
@@ -222,8 +223,9 @@ export class FSCmd {
             this.onEsc();
         }
     }
-    execCmdBuffer() {
+    async execCmdBuffer() {
         if (this.pendingExpansion) return;
+        this.failedQuery = false;
         const cmdBuffer = this.cmdBuffer;
         const hintText = this.gui.hintText;
         if (!this.gui.isMobile) this.gui.actionInput.focus();
@@ -237,22 +239,22 @@ export class FSCmd {
                     hintText.innerText = TR("可复制定理内容，按Esc取消");
                     if (cmdBuffer.length > 1) {
                         cmdBuffer.shift();
-                        this.execCmdBuffer();
+                        await this.execCmdBuffer();
                     }
                     return;
                 }
-                case "d": return this.execDeduct();
+                case "d": return await this.execDeduct();
                 // case "help": return this.execHelp();
                 case "clear": return this.execClear();
                 case "pop": return this.execPop();
-                case "meta": return this.execMetaDeduct();
+                case "meta": return await this.execMetaDeduct();
             }
             if (this.gui.unlockedMacro) switch (cmdBuffer[0]) {
                 case "metamacro": case "meta-macro": case "meta-m": case "mm": return this.execMetaMacro();
                 case "macro": case "m": return this.execMacro();
                 case "del": return this.execDel();
-                case "inln": return this.execInline();
-                case "entr": return this.execExpand();
+                case "inln": return await this.execInline();
+                case "entr": return await this.execExpand();
                 case "hyp": if (this.gui.unlockedHyp) return this.execHyp(); break;
                 case "rename": if (this.gui.unlockedRename) return this.execRename(); break;
                 case "mkdir": if (this.gui.unlockedFolder) return this.execNewFolder(); break;
@@ -262,40 +264,40 @@ export class FSCmd {
             if (cmdBuffer[0].includes(" ")) {
                 const queue = (cmdBuffer[0] as string).replaceAll(/\s([@=\+\-\*XUI><&\|\\]|<>)\s/g, "$1").replaceAll(/([,\(\:])\s+/g, "$1").split(" ").filter(e => e);
                 this.cmdBuffer = [];
-                return (async () => {
-                    for (const c of queue) {
-                        this.cmdBuffer.push(c);
-                        await this.execCmdBuffer();
-                    }
-                })();
+                for (const c of queue) {
+                    this.cmdBuffer.push(c);
+                    await this.execCmdBuffer();
+                    if (this.failedQuery) break;
+                }
+                return;
             } else {
                 if (cmdBuffer.length === 1) {
-                    try {
-                        if (this.gui.getDeduction(cmdBuffer[0])) {
-                            cmdBuffer.unshift("d");
-                            this.execCmdBuffer();
-                            return;
-                        }
-                    } catch (e) {
-                        // do nothing but wait for unknown cmd
-                    }
                     if (cmdBuffer[0][0] === "m" && this.gui.metarules.includes(cmdBuffer[0].slice(1))) {
                         cmdBuffer[0] = cmdBuffer[0].slice(1);
                         cmdBuffer.unshift("meta");
-                        this.execCmdBuffer();
+                        await this.execCmdBuffer();
+                        return;
+                    }
+                    await this.prepareDependencies(cmdBuffer[0]);
+                    if (this.gui.getDeduction(cmdBuffer[0], true)) {
+                        cmdBuffer.unshift("d");
+                        await this.execCmdBuffer();
                         return;
                     }
                 }
+                this.failedQuery = true;
                 this.clearCmdBuffer();
                 hintText.innerText = TR(`无效命令`);
             }
 
         } catch (e) {
+            this.failedQuery = true;
             this.clearCmdBuffer();
             hintText.innerText = TR(`意外的错误：`) + e;
         }
     }
-    private async prepareExpansion(name: string) {
+    private async prepareDependencies(name: string, allowAllMetaRules = false) {
+        if (name === ".") name = this.lastDeduction;
         if (!name) return;
         const controller = new AbortController();
         const fs = this.gui.formalSystem;
@@ -305,12 +307,12 @@ export class FSCmd {
         this.gui.actionInput.readOnly = true;
         try {
             await fs.prepareExpansion(name, {
-                signal: controller.signal, allowAllMetaRules: true,
+                signal: controller.signal, allowAllMetaRules,
                 onProgress: ({ rules }) => {
-                    this.gui.hintText.innerText = TR("正在准备展开") + ` (${rules}) ` + TR("，按 Esc 取消");
+                    this.gui.hintText.innerText = TR("正在准备推理依赖") + ` (${rules}) ` + TR("，按 Esc 取消");
                 }
             });
-            if (this.gui.formalSystem !== fs || this.cmdBuffer !== buffer) throw new Error("展开状态已变化，请重试 / Expansion state changed");
+            if (this.gui.formalSystem !== fs || this.cmdBuffer !== buffer) throw new Error("操作状态已变化，请重试 / Operation state changed");
         } finally {
             if (this.pendingExpansion === controller) this.pendingExpansion = undefined;
             this.gui.actionInput.readOnly = readOnly;
@@ -328,7 +330,7 @@ export class FSCmd {
             const item = this.cmdBuffer[this.cmdBuffer.length - 1];
             const name = /^p[0-9]+$/.test(item) ? this.gui.formalSystem.propositions[Number(item.slice(1))]?.from?.deductionIdx : item;
             try {
-                await this.prepareExpansion(name);
+                await this.prepareDependencies(name, true);
             } catch (e) {
                 this.cmdBuffer.pop();
                 this.execCmdBuffer();
@@ -422,7 +424,7 @@ export class FSCmd {
         let started = false;
         try {
             const proposition = formalSystem.propositions[cmdBuffer[1]];
-            await this.prepareExpansion(proposition?.from?.deductionIdx ?? cmdBuffer[1]);
+            await this.prepareDependencies(proposition?.from?.deductionIdx ?? cmdBuffer[1], true);
             fmr = formalSystem.fastmetarules;
             fsd = Object.assign({}, formalSystem.deductions);
             started = true;
@@ -460,7 +462,7 @@ export class FSCmd {
             hintText.innerText = TR("展开定理出错：") + e;
         }
     }
-    execMetaDeduct() {
+    async execMetaDeduct() {
         const cmdBuffer = this.cmdBuffer;
         const hintText = this.gui.hintText;
         const formalSystem = this.gui.formalSystem;
@@ -483,14 +485,24 @@ export class FSCmd {
         const vars = mr.replaceNames;
         const writtenConditions = new Array<string>(condLength); // conditions already inputted by user, used for hint
         let j = 0;
-        for (let i = 2; i < 2 + condLength && i < curLength; i++, j++) {
-            const idx = cmdBuffer[i];
-            if (!formalSystem.generateDeduction(idx)) {
-                this.clearCmdBuffer();
-                hintText.innerText = TR("元推理已取消：条件推理规则不存在");
-                return;
+        try {
+            for (let i = 2; i < 2 + condLength && i < curLength; i++, j++) {
+                const idx = cmdBuffer[i];
+                await this.prepareDependencies(idx);
+                if (!formalSystem.generateDeduction(idx)) {
+                    this.failedQuery = true;
+                    this.clearCmdBuffer();
+                    hintText.innerText = TR("元推理已取消：条件推理规则不存在");
+                    return;
+                }
+                writtenConditions[j] = idx;
             }
-            writtenConditions[j] = idx;
+        } catch (e) {
+            this.failedQuery = true;
+            this.escClear = true;
+            this.clearCmdBuffer();
+            hintText.innerText = TR("元推理已取消：") + e;
+            return;
         }
         writtenConditions.fill("?", j);
         let preInfo = `${TR("正在进行元推理")} ${cmdBuffer[1]} ${writtenConditions.join(", ")} : \n`;
@@ -599,11 +611,12 @@ export class FSCmd {
             this.gui.addToDeductions(newName, afterName);
             this.clearCmdBuffer();
         } catch (e) {
+            this.failedQuery = true;
             this.clearCmdBuffer();
             hintText.innerText = preInfo + TR("错误：") + e;
         }
     }
-    execDeduct() {
+    async execDeduct() {
         const cmdBuffer = this.cmdBuffer;
         const hintText = this.gui.hintText;
         const formalSystem = this.gui.formalSystem;
@@ -617,9 +630,18 @@ export class FSCmd {
         let deduction: Deduction;
         if (cmdBuffer[1].startsWith("d ")) cmdBuffer[1] = cmdBuffer[1].slice(2);
         try {
-            deduction = cmdBuffer[1] === "." ? this.gui.getDeduction(this.lastDeduction) : this.gui.getDeduction(cmdBuffer[1]);
-        } catch (e) { }
+            const name = cmdBuffer[1] === "." ? this.lastDeduction : cmdBuffer[1];
+            await this.prepareDependencies(name);
+            deduction = this.gui.getDeduction(name, true);
+        } catch (e) {
+            this.failedQuery = true;
+            this.escClear = true;
+            this.clearCmdBuffer();
+            hintText.innerText = TR("推理规则生成失败：") + e;
+            return;
+        }
         if (!deduction) {
+            this.failedQuery = true;
             this.escClear = true;
             this.clearCmdBuffer();
             hintText.innerText = TR(`推理已取消：\n未找到推理规则`) + ` ${cmdBuffer[1]}`;
@@ -1012,7 +1034,7 @@ export class FSCmd {
                     return;
                 }
                 cmdBuffer.push(idx);
-                this.execCmdBuffer();
+                return this.execCmdBuffer();
             } else {
                 // wait for replvar input
                 this.replaceActionInputFromClick(inserted);
