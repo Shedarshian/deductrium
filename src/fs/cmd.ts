@@ -305,15 +305,27 @@ export class FSCmd {
         const readOnly = this.gui.actionInput.readOnly;
         this.pendingExpansion = controller;
         this.gui.actionInput.readOnly = true;
+        let preparedRules = 0;
+        let showProgress = false;
+        const updateProgress = () => {
+            if (showProgress && !controller.signal.aborted)
+                this.gui.hintText.innerText = TR("正在准备推理依赖") + ` (${preparedRules}) ` + TR("，按 Esc 取消");
+        };
+        const hintTimer = setTimeout(() => {
+            showProgress = true;
+            updateProgress();
+        }, 5000);
         try {
             await fs.prepareExpansion(name, {
                 signal: controller.signal, allowAllMetaRules,
                 onProgress: ({ rules }) => {
-                    this.gui.hintText.innerText = TR("正在准备推理依赖") + ` (${rules}) ` + TR("，按 Esc 取消");
+                    preparedRules = rules;
+                    updateProgress();
                 }
             });
             if (this.gui.formalSystem !== fs || this.cmdBuffer !== buffer) throw new Error("操作状态已变化，请重试 / Operation state changed");
         } finally {
+            clearTimeout(hintTimer);
             if (this.pendingExpansion === controller) this.pendingExpansion = undefined;
             this.gui.actionInput.readOnly = readOnly;
         }
