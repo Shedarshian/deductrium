@@ -493,6 +493,51 @@ export class AssertionSystem {
             }
         return res;
     }
+    // Different assertion wrappers are not evidence of different terms. Keep
+    // such matches undecided rather than dropping their assertion obligations.
+    replacementEq(left, right) {
+        if (astmgr.equal(left, right))
+            return T;
+        const ln = this.getNfParams(left), rn = this.getNfParams(right);
+        if (ln || rn) {
+            const result = this.replacementEq(ln ? ln[0] : left, rn ? rn[0] : right);
+            return result === F ? F : U;
+        }
+        if (left.type !== "replvar" && right.type !== "replvar" &&
+            left.type === right.type && left.name === right.name && left.nodes?.length === right.nodes?.length) {
+            let result = T;
+            for (let i = 0; i < (left.nodes?.length ?? 0); i++)
+                result = and(result, this.replacementEq(left.nodes[i], right.nodes[i]));
+            return result;
+        }
+        return this.astEq(left, right);
+    }
+    // An nf-wrapped atom denotes the same finite term as its payload. It cannot
+    // contain a term which contains that atom under a rigid term constructor.
+    // Assertion arguments, replacement functions and unknown constructors are
+    // not evidence of an occurrence. This only proves absence; it never rewrites
+    // the wrapper or authorizes a match/capture.
+    // For every finite specialization, the rigid outer constructor makes the
+    // source strictly larger than the atom's value. No subterm of that value
+    // can equal this larger source. nf wrappers contribute no size or evidence.
+    nfAtomCannotContain(ast, source) {
+        if (!this.getNfParams(ast))
+            return false;
+        const atom = this.getVarName(ast);
+        if (!atom)
+            return false;
+        const occurs = (node, strict = false) => {
+            const nf = this.getNfParams(node);
+            if (nf)
+                return occurs(nf[0], strict);
+            if (node.type === "replvar")
+                return strict && node.name === atom;
+            const rigid = (node.type === "fn" && !/^[#$]/.test(node.name)) ||
+                (node.type === "sym" && fnSyms.includes(node.name));
+            return rigid && !!node.nodes?.some(child => occurs(child, true));
+        };
+        return occurs(source);
+    }
     // fussy search if subast exist in ast
     // return  matched positions's scopes, false if unknown
     getSubAstMatchTimes(ast, subAst, nth, dst, scope = [], res = [], right) {
@@ -508,14 +553,16 @@ export class AssertionSystem {
                 }
             }
         }
-        const eq = this.astEq(ast, subAst);
+        if (this.nfAtomCannotContain(ast, subAst))
+            return res;
+        const eq = this.replacementEq(ast, subAst);
         if (eq === T) {
             res.push(scope);
             return res;
         } // matched whole ast one time
         if (eq === U) {
-            if (nth === -1 && (this.astEq(ast, dst)))
-                return res;
+            // Even if dst equals this node, unknown nested matches may capture
+            // variables when replaced by the whole node. Do not certify them.
             return false; // unknown
         }
         // else not equal
@@ -597,7 +644,9 @@ export class AssertionSystem {
             }
         }
         // x=x, x->y, 1
-        const eq = this.astEq(ast, subAst);
+        if (this.nfAtomCannotContain(ast, subAst))
+            return res;
+        const eq = this.replacementEq(ast, subAst);
         if (eq === T) {
             // here replace happens
             if (nth === res.length || nth === -1) {
@@ -669,7 +718,7 @@ export class AssertionSystem {
                 const subName = this.getVarName(subAst);
                 if (!subName)
                     return false;
-                if (this.nf(subName, ast, [], this.getVarIsNotList(subAst)))
+                if (this.nf(subName, ast, [], this.getVarIsNotList(subAst)) === T)
                     return res;
                 return false;
             }
