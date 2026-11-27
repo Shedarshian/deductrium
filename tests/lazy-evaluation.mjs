@@ -20,6 +20,54 @@ function system() {
     return fs;
 }
 const str = ast => parser.stringifyTight(ast);
+
+test('preparation hints appear only after five seconds and track the latest progress', async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let report, finish;
+    const fs = { deductions: {}, metaRules: {}, prepareExpansion: (_, options) => {
+        report = options.onProgress;
+        return new Promise(resolve => { finish = resolve; });
+    } };
+    const cmd = ruleCommand(fs, []);
+    cmd.gui.hintText.innerText = 'Original prompt';
+    const pending = cmd.prepareDependencies('rule');
+    report({ rules: 12 });
+    t.mock.timers.tick(4999);
+    assert.equal(cmd.gui.hintText.innerText, 'Original prompt');
+    t.mock.timers.tick(1);
+    assert.match(cmd.gui.hintText.innerText, /\(12\).*Esc/);
+    report({ rules: 34 });
+    assert.match(cmd.gui.hintText.innerText, /\(34\).*Esc/);
+    finish();
+    await pending;
+    assert.equal(cmd.gui.actionInput.readOnly, false);
+});
+
+test('fast completion, failure and early Esc cancellation leave no delayed preparation hint', async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    for (const outcome of ['success', 'failure', 'cancel']) {
+        let finish;
+        const fs = { deductions: {}, metaRules: {}, prepareExpansion: (_, options) => {
+            options.onProgress({ rules: 12 });
+            return new Promise((resolve, reject) => {
+                finish = () => outcome === 'failure' ? reject(new Error('Failed')) : resolve();
+                options.signal.addEventListener('abort', () => reject(new Error('Cancelled')));
+            });
+        } };
+        const cmd = ruleCommand(fs, []);
+        cmd.gui.hintText.innerText = 'Original prompt';
+        const pending = cmd.prepareDependencies('rule');
+        t.mock.timers.tick(4999);
+        if (outcome === 'cancel') cmd.clearCmdBuffer();
+        else finish();
+        if (outcome === 'success') await pending;
+        else await assert.rejects(pending, /Failed|Cancelled/);
+        assert.equal(cmd.gui.actionInput.readOnly, false);
+        t.mock.timers.tick(10000);
+        assert.equal(cmd.gui.hintText.innerText, 'Original prompt', outcome);
+    }
+});
+
 function chain(fs, count, prefix = 't') {
     for (let i = 0; i < count; i++) {
         saves.deserializeDeduction(prefix + i, fs, ['⊢$0>$0', 'user*', [[i ? prefix + (i - 1) : '.i', [], ['$0']]]]);
