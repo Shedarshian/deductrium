@@ -194,6 +194,7 @@ export class FSGui {
         this.unlockedMacro = true;
         this.enableMIFFT_RP = true;
         document.getElementById("hyp-btn").classList.remove("hide");
+        document.getElementById("instantiate-btn").classList.remove("hide");
         document.getElementById("ach").classList.add("hide");
         document.getElementById("wrap-simpl-sysfn").classList.remove("hide");
         document.getElementById("wrap-italic-item").classList.remove("hide");
