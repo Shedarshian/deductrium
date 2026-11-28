@@ -275,6 +275,7 @@ export class Game {
                     return document.getElementById("macro-btns").classList.remove("hide");
                 case "hyp":
                     this.fsGui.unlockedHyp = true;
+                    document.getElementById("instantiate-btn").classList.remove("hide");
                     return document.getElementById("hyp-btn").classList.remove("hide");
                 case "mkdir":
                     this.fsGui.unlockedFolder = true;

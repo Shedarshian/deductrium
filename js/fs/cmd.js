@@ -1,6 +1,8 @@
 import { TR } from "../lang.js";
+import { ASTMgr } from "./astmgr.js";
 import { ASTParser } from "./astparser.js";
 import { SavesParser } from "./savesparser.js";
+import { instantiateQuantifiers } from "./instantiate.js";
 export class FSCmd {
     cmdBuffer = [];
     astparser = new ASTParser;
@@ -276,6 +278,10 @@ export class FSCmd {
                         if (this.gui.unlockedHyp)
                             return this.execHyp();
                         break;
+                    case "inst":
+                        if (this.gui.unlockedHyp)
+                            return await this.execInstantiate();
+                        break;
                     case "rename":
                         if (this.gui.unlockedRename)
                             return this.execRename();
@@ -324,6 +330,49 @@ export class FSCmd {
             this.failedQuery = true;
             this.clearCmdBuffer();
             hintText.innerText = TR(`意外的错误：`) + e;
+        }
+    }
+    async execInstantiate() {
+        if (this.cmdBuffer.length === 1) {
+            this.gui.hintText.innerText = TR("请选择定理栏中的完整定理，或输入 p编号；按 Esc 取消");
+            return;
+        }
+        const name = String(this.cmdBuffer[1]);
+        if (!/^p[0-9]+$/.test(name))
+            throw new Error(TR("请选择定理栏中的完整定理"));
+        const fs = this.gui.formalSystem, buffer = this.cmdBuffer;
+        const controller = new AbortController();
+        const readOnly = this.gui.actionInput.readOnly;
+        this.pendingExpansion = controller;
+        this.gui.actionInput.readOnly = true;
+        let showProgress = false, steps = 0;
+        const progress = () => {
+            if (showProgress && !controller.signal.aborted)
+                this.gui.hintText.innerText = TR("正在生成量词实例化步骤") + ` (${steps}) ` + TR("，按 Esc 取消");
+        };
+        const timer = setTimeout(() => { showProgress = true; progress(); }, 5000);
+        try {
+            const result = await instantiateQuantifiers(fs, Number(name.slice(1)), {
+                signal: controller.signal,
+                isCurrent: () => this.gui.formalSystem === fs && this.cmdBuffer === buffer,
+                onProgress: count => { steps = count; progress(); }
+            });
+            this.gui.hintText.innerText = TR("量词实例化完成") + ` · ${TR("推理步骤")} ${result.steps} · ${TR("新增假设")} ${result.assumptions}`;
+        }
+        catch (error) {
+            this.failedQuery = true;
+            this.gui.hintText.innerText = TR("量词实例化已停止，原证明未改动：") + error;
+        }
+        finally {
+            clearTimeout(timer);
+            if (this.pendingExpansion === controller)
+                this.pendingExpansion = undefined;
+            this.gui.actionInput.readOnly = readOnly;
+            const hint = this.gui.hintText.innerText;
+            this.escClear = true;
+            this.clearCmdBuffer();
+            this.gui.hintText.innerText = hint;
+            this.gui.updatePropositionList(true);
         }
     }
     async prepareDependencies(name, allowAllMetaRules = false) {
@@ -1055,6 +1104,20 @@ export class FSCmd {
         if (idx === "-")
             return;
         const cmdBuffer = this.cmdBuffer;
+        if (cmdBuffer[0] === "inst") {
+            const p = /^p[0-9]+$/.test(idx) ? this.gui.formalSystem.propositions[Number(idx.slice(1))] : undefined;
+            let complete = false;
+            try {
+                complete = !!p && new ASTMgr().equal(this.astparser.parse(inserted), p.value);
+            }
+            catch { }
+            if (!complete) {
+                this.gui.hintText.innerText = TR("请选择定理栏中的完整定理");
+                return;
+            }
+            cmdBuffer.push(idx);
+            return this.execCmdBuffer();
+        }
         // click prop just for copy
         if (idx.startsWith("p") && !cmdBuffer.length || cmdBuffer[0] === "copy") {
             cmdBuffer.push("copy");
